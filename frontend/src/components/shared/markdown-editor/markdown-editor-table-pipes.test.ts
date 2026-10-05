@@ -1,11 +1,17 @@
 import { Editor } from '@tiptap/core';
 import { describe, expect, it } from 'vitest';
 
+import { GROWTH_IF_QUADRATIC, slowdownWhenInputQuadruples } from '@/test-utils/cost-growth';
+
 import { createMarkdownExtensions } from './markdown-editor-extensions';
 import { escapeTablePipes } from './markdown-editor-table-pipes';
-import { roundTrip, setupEditorJsdom } from './markdown-editor-test-setup';
+import { cellsOf, roundTrip, setupEditorJsdom, structuralCounts } from './markdown-editor-test-setup';
 
 setupEditorJsdom();
+
+const plainRow = (tokenLength: number) => `| a | b |\n| --- | --- |\n| ${'a'.repeat(tokenLength)} | z |`;
+const phantomCellRow = (tokenLength: number) => `| a | b |\n| --- | --- |\n| ${'a'.repeat(tokenLength)} | y | z |`;
+const delimiterLikeLine = (spaceRun: number) => `x|y\n${'-'.repeat(50)}${' '.repeat(spaceRun)}z\n`;
 
 describe('escapeTablePipes — pure pre-lex pipe protection', () => {
     it('escapes a pipe inside a code span in a body row', () => {
@@ -63,22 +69,11 @@ describe('escapeTablePipes — pure pre-lex pipe protection', () => {
     });
 });
 
-describe('table cell with a piped code span — content survives load and converges (H1)', () => {
-    it('keeps the trailing cell and preserves the code content', () => {
-        const out = roundTrip('| Op | Meaning |\n| --- | --- |\n| `x | y` | z |');
-
-        expect(out).toContain('z');
-        expect(out).toContain('`x \\| y`');
-        expect(roundTrip(out)).toBe(out);
-    });
-
-    // This used to pin `{{.X \| upper}}` — the escaped form, which Go text/template rejects outright
-    // (`unexpected "\" in operand`), so the prompt could not be saved at all. The pipe is the template's
-    // pipeline operator and stays raw; the cell count survives because the loader masks action pipes.
+describe('table cell with a piped code span — content survives load and converges', () => {
     it('keeps a Go-template action with a pipe inside a cell', () => {
         const out = roundTrip('| Var | Out |\n| --- | --- |\n| {{.X | upper}} | done |');
 
-        expect(out).toContain('done');
+        expect(cellsOf(out)).toEqual(['Var', 'Out', '{{.X | upper}}', 'done']);
         expect(out).toContain('{{.X | upper}}');
         expect(out).not.toContain('\\|');
         expect(roundTrip(out)).toBe(out);
@@ -87,8 +82,8 @@ describe('table cell with a piped code span — content survives load and conver
     it('keeps a code span with a backtick and a pipe inside a cell', () => {
         const out = roundTrip('| Op | Meaning |\n| --- | --- |\n| `` `x` | y `` | kept |');
 
-        expect(out).toContain('kept');
-        expect(out).toContain('`` `x` \\| y ``');
+        expect(cellsOf(out)).toEqual(['Op', 'Meaning', '`x` | y', 'kept']);
+        expect(out).toContain('`` `x` | y ``');
         expect(roundTrip(out)).toBe(out);
     });
 });
@@ -103,23 +98,22 @@ describe('pipe-less GFM tables (no outer pipe) — cells survive too', () => {
     it('keeps the trailing cell of a no-leading-pipe table on round-trip', () => {
         const out = roundTrip('A | B | C\n--- | --- | ---\n`git log | head` | notes | done');
 
-        expect(out).toContain('done');
-        expect(out).toContain('`git log \\| head`');
+        expect(cellsOf(out)).toEqual(['A', 'B', 'C', 'git log | head', 'notes', 'done']);
+        expect(out).toContain('`git log | head`');
         expect(roundTrip(out)).toBe(out);
     });
 
     it('protects a template action in a no-leading-pipe body row', () => {
         const out = roundTrip('Var | Out\n--- | ---\n{{.Host | lower}} | done');
 
-        expect(out).toContain('done');
+        expect(cellsOf(out)).toEqual(['Var', 'Out', '{{.Host | lower}}', 'done']);
         expect(out).toContain('{{.Host | lower}}');
     });
 
     it('protects rows whether or not each has a leading pipe (mixed)', () => {
         const out = roundTrip('| A | B |\n| --- | --- |\n| `p | q` | one |\n`r | s` | two');
 
-        expect(out).toContain('one');
-        expect(out).toContain('two');
+        expect(cellsOf(out)).toEqual(['A', 'B', 'p | q', 'one', 'r | s', 'two']);
     });
 
     it('stops at a block boundary — a heading after the table is not escaped', () => {
@@ -154,21 +148,27 @@ describe('table cell with a pipe inside a URL — content survives load and conv
         expect(escapeTablePipes(table)).toBe(table);
     });
 
-    it('scans a table row with a long non-URL token in linear time (URL escaping ReDoS guard)', () => {
-        const evil = `| a | b |\n| --- | --- |\n| ${'a'.repeat(120000)} | z |`;
-        const started = performance.now();
+    it('scans a long non-URL token linearly on a row the cell-count guard skips', () => {
+        const row = plainRow(120_000);
 
-        escapeTablePipes(evil);
-
-        expect(performance.now() - started).toBeLessThan(100);
+        expect(escapeTablePipes(row)).toBe(row);
+        expect(slowdownWhenInputQuadruples(plainRow, escapeTablePipes, 120_000)).toBeLessThan(GROWTH_IF_QUADRATIC / 2);
     });
 
-    it('keeps the URL and the trailing cell on round-trip, and converges', () => {
-        const out = roundTrip('| A | B |\n| --- | --- |\n| [go](https://h/?x=1|2) | TRAILING |');
+    it('scans a long non-URL token linearly on a row whose extra cell drives the URL pass', () => {
+        const row = phantomCellRow(120_000);
 
-        expect(out).toContain('TRAILING');
-        expect(out).toContain('x=1\\|2');
-        expect(roundTrip(out)).toBe(out);
+        expect(escapeTablePipes(row)).toBe(row);
+        expect(slowdownWhenInputQuadruples(phantomCellRow, escapeTablePipes, 120_000)).toBeLessThan(
+            GROWTH_IF_QUADRATIC / 2,
+        );
+    });
+
+    it('keeps the URL and the trailing cell on round-trip', () => {
+        const md = '| A | B |\n| --- | --- |\n| [go](https://h/?x=1|2) | TRAILING |';
+
+        expect(structuralCounts(md)).toMatchObject({ tableCell: 2 });
+        expect(roundTrip(md)).toBe(md);
     });
 });
 
@@ -186,10 +186,10 @@ describe('tables inside a blockquote — prefix-stripped and protected', () => {
     });
 
     it('keeps the trailing cell of a blockquoted table on round-trip', () => {
-        const out = roundTrip('> | a | b |\n> | --- | --- |\n> | `x | y` | z |');
+        const src = '> | a | b |\n> | --- | --- |\n> | `x | y` | z |';
 
-        expect(out).toContain('z');
-        expect(out).toContain('`x \\| y`');
+        expect(roundTrip(src)).toBe(src);
+        expect(cellsOf(src)).toEqual(['a', 'b', 'x | y', 'z']);
     });
 
     it('leaves blockquote prose (no table) untouched', () => {
@@ -213,10 +213,10 @@ describe('fence length tracking — a longer fence is not closed by a shorter in
     });
 
     it('round-trips a table after a fence-demonstrating code block without losing the cell', () => {
-        const out = roundTrip('````\n```\ninner\n````\n\n| a | b |\n| --- | --- |\n| `x | y` | z |');
+        const src = '````\n```\ninner\n````\n\n| a | b |\n| --- | --- |\n| `x | y` | z |';
 
-        expect(out).toContain('z');
-        expect(out).toContain('`x \\| y`');
+        expect(roundTrip(src)).toBe(src);
+        expect(cellsOf(src)).toEqual(['a', 'b', 'x | y', 'z']);
     });
 });
 
@@ -228,10 +228,10 @@ describe('CRLF line endings — tables still protected', () => {
     });
 
     it('keeps the trailing cell of a CRLF table on round-trip', () => {
-        const out = roundTrip('| a | b |\r\n| --- | --- |\r\n| `x | y` | z |\r\n');
+        const src = '| a | b |\r\n| --- | --- |\r\n| `x | y` | z |\r\n';
 
-        expect(out).toContain('z');
-        expect(out).toContain('`x \\| y`');
+        expect(roundTrip(src)).toBe('| a | b |\n| --- | --- |\n| `x | y` | z |\n');
+        expect(cellsOf(src)).toEqual(['a', 'b', 'x | y', 'z']);
     });
 
     it('leaves CRLF bytes untouched when there is no table to escape', () => {
@@ -243,36 +243,16 @@ describe('CRLF line endings — tables still protected', () => {
 
 describe('TABLE_DELIMITER_LINE is linear (ReDoS guard)', () => {
     it('scans a crafted delimiter-looking line with a long trailing space run in linear time', () => {
-        const evil = `x|y\n${'-'.repeat(50)}${' '.repeat(60000)}z\n`;
-        const started = performance.now();
+        const line = delimiterLikeLine(120_000);
 
-        escapeTablePipes(evil);
-
-        expect(performance.now() - started).toBeLessThan(100);
+        expect(escapeTablePipes(line)).toBe(line);
+        expect(slowdownWhenInputQuadruples(delimiterLikeLine, escapeTablePipes, 120_000)).toBeLessThan(
+            GROWTH_IF_QUADRATIC / 2,
+        );
     });
 });
 
 describe('a backtick in a backtick fence info string is not a fence opener', () => {
-    const cellsOf = (markdown: string) => {
-        const editor = new Editor({
-            content: markdown,
-            contentType: 'markdown',
-            extensions: createMarkdownExtensions(),
-        });
-        const cells: string[] = [];
-
-        editor.state.doc.descendants((node) => {
-            if (node.type.name === 'tableCell' || node.type.name === 'tableHeader') {
-                cells.push(node.textContent);
-            }
-
-            return true;
-        });
-        editor.destroy();
-
-        return cells;
-    };
-
     const TABLE = ['| Op | Meaning |', '| --- | --- |', '| `x | y` | KEEP |'].join('\n');
 
     // marked's fence rule is /^ {0,3}(`{3,}(?=[^`\n]*(?:\n|$))|~{3,})…/ — the no-backtick lookahead applies to
@@ -291,23 +271,11 @@ describe('a backtick in a backtick fence info string is not a fence opener', () 
         expect(cellsOf(TABLE)).toEqual(['Op', 'Meaning', 'x | y', 'KEEP']);
     });
 
-    // The opposite direction of the same desynchronisation: once the phantom fence closes, the scanner's parity
-    // is inverted and it escapes pipes INSIDE a real code block, injecting a backslash into code content.
+    // The opposite direction: once the phantom fence closes, the scan takes the lines of a real code block for a table.
     it('leaves a real code block byte-identical, injecting no escape into its content', () => {
         const source = ['```a`b', '```', '', TABLE].join('\n');
-        const editor = new Editor({ content: source, contentType: 'markdown', extensions: createMarkdownExtensions() });
-        const codeBlocks: string[] = [];
 
-        editor.state.doc.descendants((node) => {
-            if (node.type.name === 'codeBlock') {
-                codeBlocks.push(node.textContent);
-            }
-
-            return true;
-        });
-        editor.destroy();
-
-        expect(codeBlocks.join('')).not.toContain('\\|');
+        expect(escapeTablePipes(source)).toBe(source);
     });
 
     it('still treats a genuine fence as a fence', () => {
@@ -318,26 +286,6 @@ describe('a backtick in a backtick fence info string is not a fence opener', () 
 });
 
 describe('tables nested inside list items keep their pipe protection', () => {
-    const cellsOf = (markdown: string) => {
-        const editor = new Editor({
-            content: markdown,
-            contentType: 'markdown',
-            extensions: createMarkdownExtensions(),
-        });
-        const cells: string[] = [];
-
-        editor.state.doc.descendants((node) => {
-            if (node.type.name === 'tableCell' || node.type.name === 'tableHeader') {
-                cells.push(node.textContent);
-            }
-
-            return true;
-        });
-        editor.destroy();
-
-        return cells;
-    };
-
     const table = (indent: string) =>
         [`${indent}| Op | Meaning |`, `${indent}| --- | --- |`, `${indent}| \`x | y\` | KEEP |`].join('\n');
 
@@ -384,26 +332,6 @@ describe('tables nested inside list items keep their pipe protection', () => {
 });
 
 describe('a Go template pipeline in a table cell keeps its own pipe', () => {
-    const cellsOf = (markdown: string) => {
-        const editor = new Editor({
-            content: markdown,
-            contentType: 'markdown',
-            extensions: createMarkdownExtensions(),
-        });
-        const cells: string[] = [];
-
-        editor.state.doc.descendants((node) => {
-            if (node.type.name === 'tableCell' || node.type.name === 'tableHeader') {
-                cells.push(node.textContent);
-            }
-
-            return true;
-        });
-        editor.destroy();
-
-        return cells;
-    };
-
     // `{{.Host | urlquery}}` is a Go text/template pipeline. Escaping its pipe makes text/template reject the
     // whole file with `unexpected "\" in operand`, so the prompt cannot be saved at all.
     it('does not escape a pipeline in a body cell on save', () => {
@@ -437,10 +365,98 @@ describe('a Go template pipeline in a table cell keeps its own pipe', () => {
 
         expect(roundTrip(once)).toBe(once);
     });
+});
+describe('the scan takes for a row only what marked takes for one', () => {
+    it.each([
+        ['a standard HTML block tag under the table', '| a |\n|---|\n<p>`x | y`</p>'],
+        ['a closing block tag under the table', '| a |\n|---|\n| 1 |\n</details>\n`x | y`'],
+        [
+            'a template control line under the table',
+            '| a | b |\n|---|---|\n{{ range .Rows }}| `x | y` | z |\n{{ end }}',
+        ],
+    ])('leaves the pipes of %s alone', (_name, md) => {
+        expect(escapeTablePipes(md)).toBe(md);
+    });
 
-    // A structural pipe still has to be escaped when it is real content, not a template operator.
-    it('still escapes a pipe inside a code span', () => {
-        expect(roundTrip('| a | b |\n| --- | --- |\n| `x | y` | z |')).toContain('\\|');
+    it.each([
+        ['a tag that is no HTML block', '| a |\n|---|\n<tool>`x | y`</tool>', '| a |\n|---|\n<tool>`x \\| y`</tool>'],
+        ['an action that is no control line', '| a |\n|---|\n{{ .X }} `x | y`', '| a |\n|---|\n{{ .X }} `x \\| y`'],
+        [
+            'an action with a brace in a string',
+            '| a |\n|---|\n| {{ printf "{%s}" .X | print }} |',
+            '| a |\n|---|\n| {{ printf "{%s}" .X \\| print }} |',
+        ],
+    ])('still protects the row of %s', (_name, md, escaped) => {
+        expect(escapeTablePipes(md)).toBe(escaped);
+    });
+
+    it.each([
+        [
+            'a heading over a row of dashes',
+            '## T | N\n|---|---|\n| `a | b` | {{ .A | print }} |',
+            '| `a | b` | {{ .A | print }} |',
+        ],
+        ['a line indented like code over a row of dashes', '    a | b\n|---|---|\n| `x | y` | c |', '| `x | y` | c |'],
+    ])('leaves no trace in %s, which is no table', (_name, md, row) => {
+        const saved = roundTrip(md);
+
+        expect(structuralCounts(md).table).toBeUndefined();
+        expect(saved.split('\n').at(-1)).toBe(row);
+        expect(roundTrip(saved)).toBe(saved);
+    });
+
+    it.each([
+        ['a row with a cell too many', '| a | b |\n|---|---|\n| 1 | 2 | `x | y` |'],
+        ['a line of nothing but actions', '| a | b |\n|---|---|\n{{ $n := len .Rows }} {{/* `x | y` */}}'],
+        ['the rows under the line that ended the table', '| a | b |\n|---|---|\n{{ range .R }}\n| `x | y` | 2 |'],
+    ])('leaves the pipes of %s alone', (_name, md) => {
+        expect(escapeTablePipes(md)).toBe(md);
+    });
+
+    it('finds the table under an item that opens its fence on the marker line', () => {
+        const list = '1. Run:\n   ```sh\n   nmap\n   ```\n2. ```sh\n   curl\n   ```\n\n';
+
+        expect(escapeTablePipes(`${list}| a | b |\n|---|---|\n| \`x | y\` | 2 |`)).toBe(
+            `${list}| a | b |\n|---|---|\n| \`x \\| y\` | 2 |`,
+        );
+    });
+
+    it('takes a string that holds the end of an action for part of the action', () => {
+        expect(escapeTablePipes('| a | b |\n|---|---|\n| {{ print "}}" | print }} | 2 |')).toBe(
+            '| a | b |\n|---|---|\n| {{ print "}}" \\| print }} | 2 |',
+        );
+    });
+
+    it('finds actions that hold strings in time that grows with the row, not with the square of it', () => {
+        const row = (size: number) => `| a |\n|---|\n| ${'{{ "x '.repeat(size / 7)} |`;
+
+        expect(slowdownWhenInputQuadruples(row, escapeTablePipes, 140_000)).toBeLessThan(GROWTH_IF_QUADRATIC / 2);
+    });
+
+    it('keeps a row that opens with an action whose name only begins with a control word', () => {
+        const md = '| a | b |\n|---|---|\n{{ endpoint }} | 2\n{{ iffy .X }} | 3';
+
+        expect(structuralCounts(md).tableRow).toBe(3);
+        expect(escapeTablePipes(`${md} \`x | y\``)).toBe(`${md} \`x \\| y\``);
+    });
+
+    it('protects with a backslash in a document that holds the stand-in itself', () => {
+        const saved = roundTrip('x \uE002 y\n\n| a | b |\n|---|---|\n| `p | q` | 2 |');
+
+        expect(saved).toBe('x \uE002 y\n\n| a | b |\n|---|---|\n| `p \\| q` | 2 |');
+        expect(roundTrip(saved)).toBe(saved);
+    });
+
+    it('writes the pipes it protects as the stand-in it is asked for', () => {
+        expect(escapeTablePipes('| a | b |\n|---|---|\n| `x | y` | {{ .A | print }} |', '\uE002')).toBe(
+            '| a | b |\n|---|---|\n| `x \uE002 y` | {{ .A \uE002 print }} |',
+        );
+    });
+
+    it('finds actions in time that grows with the row, not with the square of it', () => {
+        const row = (size: number) => `| a |\n|---|\n| ${'{{ x { '.repeat(size / 7)} |`;
+
+        expect(slowdownWhenInputQuadruples(row, escapeTablePipes, 140_000)).toBeLessThan(GROWTH_IF_QUADRATIC / 2);
     });
 });
 
@@ -468,9 +484,6 @@ describe('a table with no header row keeps its row count across a save', () => {
         return { rows, saved };
     };
 
-    // GFM has no headerless table, so the serializer used to emit an EMPTY header row above the demoted rows:
-    // every header-off + save + reload cycle grew the table by one blank row (2 → 3 → 4) and the switch
-    // silently flipped back on. Promoting the first row keeps the row count and every cell.
     it('does not grow when the header row is toggled off', () => {
         const editor = new Editor({
             content: ['| a | b |', '| --- | --- |', '| 1 | 2 |'].join('\n'),
@@ -509,9 +522,6 @@ describe('adjacent tables do not accumulate blank paragraphs', () => {
         return kinds.join(',');
     };
 
-    // The table renderer emits a newline of its own on top of the block separator, so between two adjacent
-    // tables that extra line reloaded as an empty paragraph — which serialised to another blank line on the
-    // next save. Measured before the fix: 68 → 88 → 90 → 92 → 94 bytes, one paragraph per cycle, no fixed point.
     it('keeps two tables adjacent across repeated saves', () => {
         const source = ['| a | b |', '| --- | --- |', '| 1 | 2 |', '', '| c | d |', '| --- | --- |', '| 3 | 4 |'].join(
             '\n',

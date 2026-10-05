@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -15,14 +17,15 @@ import (
 )
 
 const (
-	EmbeddedLLMConfigsPath   = "providers-configs"
-	DefaultDockerCertPath    = "/opt/pentagi/docker/ssl"
-	DefaultCustomConfigsPath = "/opt/pentagi/conf/custom.provider.yml"
-	DefaultOllamaConfigsPath = "/opt/pentagi/conf/ollama.provider.yml"
-	DefaultLLMConfigsPath    = "/opt/pentagi/conf/"
-	DefaultScraperBaseURL    = "https://scraper/"
-	DefaultScraperDomain     = "scraper"
-	DefaultScraperSchema     = "https"
+	EmbeddedLLMConfigsPath    = "providers-configs"
+	DefaultDockerCertPath     = "/opt/pentagi/docker/ssl"
+	DefaultCustomConfigsPath  = "/opt/pentagi/conf/custom.provider.yml"
+	DefaultOllamaConfigsPath  = "/opt/pentagi/conf/ollama.provider.yml"
+	DefaultBedrockConfigsPath = "/opt/pentagi/conf/bedrock.provider.yml"
+	DefaultLLMConfigsPath     = "/opt/pentagi/conf/"
+	DefaultScraperBaseURL     = "https://scraper/"
+	DefaultScraperDomain      = "scraper"
+	DefaultScraperSchema      = "https"
 )
 
 type Controller interface {
@@ -148,8 +151,8 @@ type LLMProviderConfig struct {
 
 	// direct form field mappings using loader.EnvVar
 	// these fields directly correspond to environment variables and form inputs (not computed)
-	BaseURL loader.EnvVar // OPEN_AI_SERVER_URL | ANTHROPIC_SERVER_URL | GEMINI_SERVER_URL | BEDROCK_SERVER_URL | OLLAMA_SERVER_URL | DEEPSEEK_SERVER_URL | GLM_SERVER_URL | KIMI_SERVER_URL | QWEN_SERVER_URL | MINIMAX_SERVER_URL | LLM_SERVER_URL
-	APIKey  loader.EnvVar // OPEN_AI_KEY | ANTHROPIC_API_KEY | GEMINI_API_KEY | LLM_SERVER_KEY | DEEPSEEK_API_KEY | GLM_API_KEY | KIMI_API_KEY | QWEN_API_KEY | MINIMAX_API_KEY | OLLAMA_SERVER_API_KEY
+	BaseURL loader.EnvVar // OPEN_AI_SERVER_URL | ANTHROPIC_SERVER_URL | GEMINI_SERVER_URL | BEDROCK_SERVER_URL | OLLAMA_SERVER_URL | LLM_SERVER_URL | <prefix>_SERVER_URL of openAICompatDoors
+	APIKey  loader.EnvVar // OPEN_AI_KEY | ANTHROPIC_API_KEY | GEMINI_API_KEY | LLM_SERVER_KEY | OLLAMA_SERVER_API_KEY | <prefix>_API_KEY of openAICompatDoors
 	Model   loader.EnvVar // LLM_SERVER_MODEL
 	// AWS Bedrock specific fields
 	DefaultAuth  loader.EnvVar // BEDROCK_DEFAULT_AUTH
@@ -158,13 +161,21 @@ type LLMProviderConfig struct {
 	SecretKey    loader.EnvVar // BEDROCK_SECRET_ACCESS_KEY
 	SessionToken loader.EnvVar // BEDROCK_SESSION_TOKEN
 	Region       loader.EnvVar // BEDROCK_REGION
-	// Ollama and Custom specific fields
-	ConfigPath        loader.EnvVar // OLLAMA_SERVER_CONFIG_PATH | LLM_SERVER_CONFIG_PATH
-	HostConfigPath    loader.EnvVar // PENTAGI_OLLAMA_SERVER_CONFIG_PATH | PENTAGI_LLM_SERVER_CONFIG_PATH
-	LegacyReasoning   loader.EnvVar // LLM_SERVER_LEGACY_REASONING
+	// Anthropic federated (enterprise) auth fields
+	AnthropicOrganizationID    loader.EnvVar // ANTHROPIC_ORGANIZATION_ID
+	AnthropicWorkspaceID       loader.EnvVar // ANTHROPIC_WORKSPACE_ID
+	AnthropicServiceAccountID  loader.EnvVar // ANTHROPIC_SERVICE_ACCOUNT_ID
+	AnthropicIdentityToken     loader.EnvVar // ANTHROPIC_IDENTITY_TOKEN
+	AnthropicIdentityTokenFile loader.EnvVar // ANTHROPIC_IDENTITY_TOKEN_FILE
+	AnthropicFederationRuleID  loader.EnvVar // ANTHROPIC_FEDERATION_RULE_ID
+	// Bedrock, Ollama and Custom specific fields
+	ConfigPath        loader.EnvVar // BEDROCK_CONFIG_PATH | OLLAMA_SERVER_CONFIG_PATH | LLM_SERVER_CONFIG_PATH
+	HostConfigPath    loader.EnvVar // PENTAGI_BEDROCK_CONFIG_PATH | PENTAGI_OLLAMA_SERVER_CONFIG_PATH | PENTAGI_LLM_SERVER_CONFIG_PATH
 	PreserveReasoning loader.EnvVar // LLM_SERVER_PRESERVE_REASONING
+	APIType           loader.EnvVar // LLM_SERVER_API_TYPE
+	APIVersion        loader.EnvVar // LLM_SERVER_API_VERSION
 	// Custom specific fields
-	ProviderName loader.EnvVar // LLM_SERVER_PROVIDER | DEEPSEEK_PROVIDER | GLM_PROVIDER | KIMI_PROVIDER | QWEN_PROVIDER | MINIMAX_PROVIDER
+	ProviderName loader.EnvVar // LLM_SERVER_PROVIDER | <prefix>_PROVIDER of openAICompatDoors
 	// Ollama specific fields
 	PullTimeout       loader.EnvVar // OLLAMA_SERVER_PULL_MODELS_TIMEOUT
 	PullEnabled       loader.EnvVar // OLLAMA_SERVER_PULL_MODELS_ENABLED
@@ -177,11 +188,32 @@ type LLMProviderConfig struct {
 	EmbeddedLLMConfigsPath []string
 }
 
+// llmConfigMountPaths are where docker-compose.yml mounts a provider config from the host:
+// the file PENTAGI_<X>_CONFIG_PATH names, or ./example.<provider>.provider.yml beside the
+// compose file when that variable is empty. What stands there is the host's file and not
+// one the image ships, so none of them is offered as embedded, whatever examples/configs
+// holds under the same name.
+var llmConfigMountPaths = map[string]string{
+	"custom":  DefaultCustomConfigsPath,
+	"ollama":  DefaultOllamaConfigsPath,
+	"bedrock": DefaultBedrockConfigsPath,
+}
+
+// LLMConfigMountPath is where the provider's config is mounted in the container, or empty
+// for a provider that takes none.
+func LLMConfigMountPath(providerID string) string {
+	return llmConfigMountPaths[providerID]
+}
+
 func GetEmbeddedLLMConfigsPath(files files.Files) []string {
 	providersConfigsPath := make([]string, 0)
+	mountPaths := slices.Collect(maps.Values(llmConfigMountPaths))
 	if confFiles, err := files.List(EmbeddedLLMConfigsPath); err == nil {
 		for _, confFile := range confFiles {
 			confPath := DefaultLLMConfigsPath + strings.TrimPrefix(confFile, EmbeddedLLMConfigsPath+"/")
+			if slices.Contains(mountPaths, confPath) {
+				continue
+			}
 			providersConfigsPath = append(providersConfigsPath, confPath)
 		}
 		sort.Strings(providersConfigsPath)
@@ -190,21 +222,45 @@ func GetEmbeddedLLMConfigsPath(files files.Files) []string {
 	return providersConfigsPath
 }
 
+// openAICompatDoors are the providers the wizard configures with the same three
+// variables: <prefix>_API_KEY, <prefix>_SERVER_URL and <prefix>_PROVIDER.
+var openAICompatDoors = []struct {
+	id, name, prefix string
+}{
+	{"deepseek", "DeepSeek", "DEEPSEEK"},
+	{"glm", "GLM", "GLM"},
+	{"kimi", "Kimi", "KIMI"},
+	{"qwen", "Qwen", "QWEN"},
+	{"minimax", "MiniMax", "MINIMAX"},
+	{"mistral", "Mistral", "MISTRAL"},
+	{"xai", "xAI", "XAI"},
+}
+
+func openAICompatDoor(providerID string) (name, prefix string, ok bool) {
+	for _, door := range openAICompatDoors {
+		if door.id == providerID {
+			return door.name, door.prefix, true
+		}
+	}
+
+	return "", "", false
+}
+
 // GetLLMProviders returns configured LLM providers
 func (c *controller) GetLLMProviders() map[string]*LLMProviderConfig {
-	return map[string]*LLMProviderConfig{
+	providers := map[string]*LLMProviderConfig{
 		"openai":    c.GetLLMProviderConfig("openai"),
 		"anthropic": c.GetLLMProviderConfig("anthropic"),
 		"gemini":    c.GetLLMProviderConfig("gemini"),
 		"bedrock":   c.GetLLMProviderConfig("bedrock"),
 		"ollama":    c.GetLLMProviderConfig("ollama"),
-		"deepseek":  c.GetLLMProviderConfig("deepseek"),
-		"glm":       c.GetLLMProviderConfig("glm"),
-		"kimi":      c.GetLLMProviderConfig("kimi"),
-		"qwen":      c.GetLLMProviderConfig("qwen"),
-		"minimax":   c.GetLLMProviderConfig("minimax"),
 		"custom":    c.GetLLMProviderConfig("custom"),
 	}
+	for _, door := range openAICompatDoors {
+		providers[door.id] = c.GetLLMProviderConfig(door.id)
+	}
+
+	return providers
 }
 
 // GetLLMProviderConfig returns the current LLM provider configuration
@@ -213,6 +269,16 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 	providerConfig := &LLMProviderConfig{
 		Name:                   "Unknown",
 		EmbeddedLLMConfigsPath: providersConfigsPath,
+	}
+
+	if name, prefix, ok := openAICompatDoor(providerID); ok {
+		providerConfig.Name = name
+		providerConfig.APIKey, _ = c.GetVar(prefix + "_API_KEY")
+		providerConfig.BaseURL, _ = c.GetVar(prefix + "_SERVER_URL")
+		providerConfig.ProviderName, _ = c.GetVar(prefix + "_PROVIDER")
+		providerConfig.Configured = providerConfig.APIKey.Value != ""
+
+		return providerConfig
 	}
 
 	switch providerID {
@@ -226,7 +292,13 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 		providerConfig.Name = "Anthropic"
 		providerConfig.APIKey, _ = c.GetVar("ANTHROPIC_API_KEY")
 		providerConfig.BaseURL, _ = c.GetVar("ANTHROPIC_SERVER_URL")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
+		providerConfig.AnthropicOrganizationID, _ = c.GetVar("ANTHROPIC_ORGANIZATION_ID")
+		providerConfig.AnthropicWorkspaceID, _ = c.GetVar("ANTHROPIC_WORKSPACE_ID")
+		providerConfig.AnthropicServiceAccountID, _ = c.GetVar("ANTHROPIC_SERVICE_ACCOUNT_ID")
+		providerConfig.AnthropicIdentityToken, _ = c.GetVar("ANTHROPIC_IDENTITY_TOKEN")
+		providerConfig.AnthropicIdentityTokenFile, _ = c.GetVar("ANTHROPIC_IDENTITY_TOKEN_FILE")
+		providerConfig.AnthropicFederationRuleID, _ = c.GetVar("ANTHROPIC_FEDERATION_RULE_ID")
+		providerConfig.Configured = providerConfig.APIKey.Value != "" || c.anthropicFederated()
 
 	case "gemini":
 		providerConfig.Name = "Google Gemini"
@@ -243,6 +315,9 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 		providerConfig.SecretKey, _ = c.GetVar("BEDROCK_SECRET_ACCESS_KEY")
 		providerConfig.SessionToken, _ = c.GetVar("BEDROCK_SESSION_TOKEN")
 		providerConfig.BaseURL, _ = c.GetVar("BEDROCK_SERVER_URL")
+		providerConfig.ConfigPath, _ = c.GetVar("BEDROCK_CONFIG_PATH")
+		providerConfig.HostConfigPath, _ = c.GetVar("PENTAGI_BEDROCK_CONFIG_PATH")
+		providerConfig.showConfigPath(LLMConfigMountPath("bedrock"))
 		// Configured if any of three auth methods is set: DefaultAuth, BearerToken, or AccessKey+SecretKey
 		providerConfig.Configured = providerConfig.DefaultAuth.Value == "true" ||
 			providerConfig.BearerToken.Value != "" ||
@@ -254,49 +329,12 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 		providerConfig.APIKey, _ = c.GetVar("OLLAMA_SERVER_API_KEY")
 		providerConfig.ConfigPath, _ = c.GetVar("OLLAMA_SERVER_CONFIG_PATH")
 		providerConfig.HostConfigPath, _ = c.GetVar("PENTAGI_OLLAMA_SERVER_CONFIG_PATH")
-		if slices.Contains(providersConfigsPath, providerConfig.ConfigPath.Value) {
-			providerConfig.HostConfigPath.Value = providerConfig.ConfigPath.Value
-		}
+		providerConfig.showConfigPath(LLMConfigMountPath("ollama"))
 		providerConfig.Model, _ = c.GetVar("OLLAMA_SERVER_MODEL")
 		providerConfig.PullTimeout, _ = c.GetVar("OLLAMA_SERVER_PULL_MODELS_TIMEOUT")
 		providerConfig.PullEnabled, _ = c.GetVar("OLLAMA_SERVER_PULL_MODELS_ENABLED")
 		providerConfig.LoadModelsEnabled, _ = c.GetVar("OLLAMA_SERVER_LOAD_MODELS_ENABLED")
 		providerConfig.Configured = providerConfig.BaseURL.Value != ""
-
-	case "deepseek":
-		providerConfig.Name = "DeepSeek"
-		providerConfig.APIKey, _ = c.GetVar("DEEPSEEK_API_KEY")
-		providerConfig.BaseURL, _ = c.GetVar("DEEPSEEK_SERVER_URL")
-		providerConfig.ProviderName, _ = c.GetVar("DEEPSEEK_PROVIDER")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
-
-	case "glm":
-		providerConfig.Name = "GLM"
-		providerConfig.APIKey, _ = c.GetVar("GLM_API_KEY")
-		providerConfig.BaseURL, _ = c.GetVar("GLM_SERVER_URL")
-		providerConfig.ProviderName, _ = c.GetVar("GLM_PROVIDER")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
-
-	case "kimi":
-		providerConfig.Name = "Kimi"
-		providerConfig.APIKey, _ = c.GetVar("KIMI_API_KEY")
-		providerConfig.BaseURL, _ = c.GetVar("KIMI_SERVER_URL")
-		providerConfig.ProviderName, _ = c.GetVar("KIMI_PROVIDER")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
-
-	case "qwen":
-		providerConfig.Name = "Qwen"
-		providerConfig.APIKey, _ = c.GetVar("QWEN_API_KEY")
-		providerConfig.BaseURL, _ = c.GetVar("QWEN_SERVER_URL")
-		providerConfig.ProviderName, _ = c.GetVar("QWEN_PROVIDER")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
-
-	case "minimax":
-		providerConfig.Name = "MiniMax"
-		providerConfig.APIKey, _ = c.GetVar("MINIMAX_API_KEY")
-		providerConfig.BaseURL, _ = c.GetVar("MINIMAX_SERVER_URL")
-		providerConfig.ProviderName, _ = c.GetVar("MINIMAX_PROVIDER")
-		providerConfig.Configured = providerConfig.APIKey.Value != ""
 
 	case "custom":
 		providerConfig.Name = "Custom"
@@ -305,11 +343,10 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 		providerConfig.Model, _ = c.GetVar("LLM_SERVER_MODEL")
 		providerConfig.ConfigPath, _ = c.GetVar("LLM_SERVER_CONFIG_PATH")
 		providerConfig.HostConfigPath, _ = c.GetVar("PENTAGI_LLM_SERVER_CONFIG_PATH")
-		if slices.Contains(providersConfigsPath, providerConfig.ConfigPath.Value) {
-			providerConfig.HostConfigPath.Value = providerConfig.ConfigPath.Value
-		}
-		providerConfig.LegacyReasoning, _ = c.GetVar("LLM_SERVER_LEGACY_REASONING")
+		providerConfig.showConfigPath(LLMConfigMountPath("custom"))
 		providerConfig.PreserveReasoning, _ = c.GetVar("LLM_SERVER_PRESERVE_REASONING")
+		providerConfig.APIType, _ = c.GetVar("LLM_SERVER_API_TYPE")
+		providerConfig.APIVersion, _ = c.GetVar("LLM_SERVER_API_VERSION")
 		providerConfig.ProviderName, _ = c.GetVar("LLM_SERVER_PROVIDER")
 		providerConfig.Configured = providerConfig.BaseURL.Value != "" && providerConfig.APIKey.Value != "" &&
 			(providerConfig.Model.Value != "" || providerConfig.ConfigPath.Value != "")
@@ -318,8 +355,31 @@ func (c *controller) GetLLMProviderConfig(providerID string) *LLMProviderConfig 
 	return providerConfig
 }
 
+// anthropicFederated is the federation half of anthropic.Configured, applied to
+// the .env the wizard edits; keep the two in step.
+func (c *controller) anthropicFederated() bool {
+	set := func(name string) bool {
+		envVar, _ := c.GetVar(name)
+		return envVar.Value != ""
+	}
+
+	return set("ANTHROPIC_FEDERATION_RULE_ID") && set("ANTHROPIC_ORGANIZATION_ID") &&
+		set("ANTHROPIC_SERVICE_ACCOUNT_ID") &&
+		(set("ANTHROPIC_IDENTITY_TOKEN_FILE") || set("ANTHROPIC_IDENTITY_TOKEN"))
+}
+
 // UpdateLLMProviderConfig updates a specific LLM provider configuration
 func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProviderConfig) error {
+	if _, _, ok := openAICompatDoor(providerID); ok {
+		for _, envVar := range []loader.EnvVar{config.APIKey, config.BaseURL, config.ProviderName} {
+			if err := c.SetVar(envVar.Name, envVar.Value); err != nil {
+				return fmt.Errorf("failed to set %s: %w", envVar.Name, err)
+			}
+		}
+
+		return nil
+	}
+
 	switch providerID {
 	case "openai":
 		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
@@ -330,11 +390,16 @@ func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProvi
 		}
 
 	case "anthropic":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
+		anthropicVars := []loader.EnvVar{
+			config.APIKey, config.BaseURL,
+			config.AnthropicOrganizationID, config.AnthropicWorkspaceID,
+			config.AnthropicServiceAccountID, config.AnthropicIdentityToken,
+			config.AnthropicIdentityTokenFile, config.AnthropicFederationRuleID,
 		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
+		for _, envVar := range anthropicVars {
+			if err := c.SetVar(envVar.Name, envVar.Value); err != nil {
+				return fmt.Errorf("failed to set %s: %w", envVar.Name, err)
+			}
 		}
 
 	case "gemini":
@@ -367,6 +432,9 @@ func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProvi
 		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
 			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
 		}
+		if err := c.setLLMConfigPaths(config, LLMConfigMountPath("bedrock")); err != nil {
+			return err
+		}
 
 	case "ollama":
 		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
@@ -388,77 +456,8 @@ func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProvi
 			return fmt.Errorf("failed to set %s: %w", config.LoadModelsEnabled.Name, err)
 		}
 
-		var containerPath, hostPath string
-		if config.HostConfigPath.Value != "" {
-			if slices.Contains(config.EmbeddedLLMConfigsPath, config.HostConfigPath.Value) {
-				containerPath = config.HostConfigPath.Value
-				hostPath = ""
-			} else {
-				containerPath = DefaultOllamaConfigsPath
-				hostPath = config.HostConfigPath.Value
-			}
-		}
-
-		if err := c.SetVar(config.ConfigPath.Name, containerPath); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ConfigPath.Name, err)
-		}
-		if err := c.SetVar(config.HostConfigPath.Name, hostPath); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.HostConfigPath.Name, err)
-		}
-
-	case "deepseek":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
-		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
-		}
-		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
-		}
-
-	case "glm":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
-		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
-		}
-		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
-		}
-
-	case "kimi":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
-		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
-		}
-		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
-		}
-
-	case "qwen":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
-		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
-		}
-		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
-		}
-
-	case "minimax":
-		if err := c.SetVar(config.APIKey.Name, config.APIKey.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.APIKey.Name, err)
-		}
-		if err := c.SetVar(config.BaseURL.Name, config.BaseURL.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.BaseURL.Name, err)
-		}
-		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
+		if err := c.setLLMConfigPaths(config, LLMConfigMountPath("ollama")); err != nil {
+			return err
 		}
 
 	case "custom":
@@ -471,33 +470,58 @@ func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProvi
 		if err := c.SetVar(config.Model.Name, config.Model.Value); err != nil {
 			return fmt.Errorf("failed to set %s: %w", config.Model.Name, err)
 		}
-		if err := c.SetVar(config.LegacyReasoning.Name, config.LegacyReasoning.Value); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.LegacyReasoning.Name, err)
-		}
 		if err := c.SetVar(config.PreserveReasoning.Name, config.PreserveReasoning.Value); err != nil {
 			return fmt.Errorf("failed to set %s: %w", config.PreserveReasoning.Name, err)
+		}
+		if err := c.SetVar(config.APIType.Name, config.APIType.Value); err != nil {
+			return fmt.Errorf("failed to set %s: %w", config.APIType.Name, err)
+		}
+		if err := c.SetVar(config.APIVersion.Name, config.APIVersion.Value); err != nil {
+			return fmt.Errorf("failed to set %s: %w", config.APIVersion.Name, err)
 		}
 		if err := c.SetVar(config.ProviderName.Name, config.ProviderName.Value); err != nil {
 			return fmt.Errorf("failed to set %s: %w", config.ProviderName.Name, err)
 		}
 
-		var containerPath, hostPath string
-		if config.HostConfigPath.Value != "" {
-			if slices.Contains(config.EmbeddedLLMConfigsPath, config.HostConfigPath.Value) {
-				containerPath = config.HostConfigPath.Value
-				hostPath = ""
-			} else {
-				containerPath = DefaultCustomConfigsPath
-				hostPath = config.HostConfigPath.Value
-			}
+		if err := c.setLLMConfigPaths(config, LLMConfigMountPath("custom")); err != nil {
+			return err
 		}
+	}
 
-		if err := c.SetVar(config.ConfigPath.Name, containerPath); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.ConfigPath.Name, err)
-		}
-		if err := c.SetVar(config.HostConfigPath.Name, hostPath); err != nil {
-			return fmt.Errorf("failed to set %s: %w", config.HostConfigPath.Name, err)
-		}
+	return nil
+}
+
+// showConfigPath puts into HostConfigPath the one path the form shows for the two
+// variables: a path in the container when the backend reads a config the image ships or
+// the file compose mounts at mountPath by default, the file on the host otherwise.
+func (config *LLMProviderConfig) showConfigPath(mountPath string) {
+	inContainer := config.ConfigPath.Value
+	switch {
+	case slices.Contains(config.EmbeddedLLMConfigsPath, inContainer):
+		config.HostConfigPath.Value = inContainer
+	case inContainer == mountPath && config.HostConfigPath.Value == "":
+		config.HostConfigPath.Value = mountPath
+	}
+}
+
+// setLLMConfigPaths is showConfigPath read backwards: a path in the container is named to
+// the backend as it is with the host variable cleared, any other path is a file on the
+// host, mounted at mountPath.
+func (c *controller) setLLMConfigPaths(config *LLMProviderConfig, mountPath string) error {
+	var containerPath, hostPath string
+	switch typed := config.HostConfigPath.Value; {
+	case typed == "":
+	case typed == mountPath || slices.Contains(config.EmbeddedLLMConfigsPath, typed):
+		containerPath = typed
+	default:
+		containerPath, hostPath = mountPath, typed
+	}
+
+	if err := c.SetVar(config.ConfigPath.Name, containerPath); err != nil {
+		return fmt.Errorf("failed to set %s: %w", config.ConfigPath.Name, err)
+	}
+	if err := c.SetVar(config.HostConfigPath.Name, hostPath); err != nil {
+		return fmt.Errorf("failed to set %s: %w", config.HostConfigPath.Name, err)
 	}
 
 	return nil
@@ -506,18 +530,28 @@ func (c *controller) UpdateLLMProviderConfig(providerID string, config *LLMProvi
 // ResetLLMProviderConfig resets a specific LLM provider configuration
 func (c *controller) ResetLLMProviderConfig(providerID string) map[string]*LLMProviderConfig {
 	var vars []string
+	if _, prefix, ok := openAICompatDoor(providerID); ok {
+		vars = []string{prefix + "_API_KEY", prefix + "_SERVER_URL", prefix + "_PROVIDER"}
+	}
+
 	switch providerID {
 	case "openai":
 		vars = []string{"OPEN_AI_KEY", "OPEN_AI_SERVER_URL"}
 	case "anthropic":
-		vars = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_SERVER_URL"}
+		vars = []string{
+			"ANTHROPIC_API_KEY", "ANTHROPIC_SERVER_URL",
+			"ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_WORKSPACE_ID",
+			"ANTHROPIC_SERVICE_ACCOUNT_ID", "ANTHROPIC_IDENTITY_TOKEN",
+			"ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_FEDERATION_RULE_ID",
+		}
 	case "gemini":
 		vars = []string{"GEMINI_API_KEY", "GEMINI_SERVER_URL"}
 	case "bedrock":
 		vars = []string{
 			"BEDROCK_DEFAULT_AUTH", "BEDROCK_BEARER_TOKEN",
 			"BEDROCK_ACCESS_KEY_ID", "BEDROCK_SECRET_ACCESS_KEY", "BEDROCK_SESSION_TOKEN",
-			"BEDROCK_REGION", "BEDROCK_SERVER_URL",
+			"BEDROCK_REGION", "BEDROCK_SERVER_URL", "BEDROCK_CONFIG_PATH",
+			"PENTAGI_BEDROCK_CONFIG_PATH",
 		}
 	case "ollama":
 		vars = []string{
@@ -530,21 +564,12 @@ func (c *controller) ResetLLMProviderConfig(providerID string) map[string]*LLMPr
 			"OLLAMA_SERVER_LOAD_MODELS_ENABLED",
 			"PENTAGI_OLLAMA_SERVER_CONFIG_PATH",
 		}
-	case "deepseek":
-		vars = []string{"DEEPSEEK_API_KEY", "DEEPSEEK_SERVER_URL", "DEEPSEEK_PROVIDER"}
-	case "glm":
-		vars = []string{"GLM_API_KEY", "GLM_SERVER_URL", "GLM_PROVIDER"}
-	case "kimi":
-		vars = []string{"KIMI_API_KEY", "KIMI_SERVER_URL", "KIMI_PROVIDER"}
-	case "qwen":
-		vars = []string{"QWEN_API_KEY", "QWEN_SERVER_URL", "QWEN_PROVIDER"}
-	case "minimax":
-		vars = []string{"MINIMAX_API_KEY", "MINIMAX_SERVER_URL", "MINIMAX_PROVIDER"}
 	case "custom":
 		vars = []string{
 			"LLM_SERVER_URL", "LLM_SERVER_KEY", "LLM_SERVER_MODEL",
-			"LLM_SERVER_CONFIG_PATH", "LLM_SERVER_LEGACY_REASONING",
+			"LLM_SERVER_CONFIG_PATH",
 			"LLM_SERVER_PRESERVE_REASONING", "LLM_SERVER_PROVIDER",
+			"LLM_SERVER_API_TYPE", "LLM_SERVER_API_VERSION",
 			"PENTAGI_LLM_SERVER_CONFIG_PATH", // local path to the LLM config file
 		}
 	}
@@ -907,7 +932,7 @@ func (c *controller) UpdateGraphitiConfig(config *GraphitiConfig) error {
 	}
 
 	// set deployment type based configuration
-	vars := map[string]string{}
+	var vars map[string]string
 	switch config.DeploymentType {
 	case "embedded":
 		// for embedded mode, use default endpoint
@@ -1310,12 +1335,18 @@ func (c *controller) GetEmbedderConfig() *EmbedderConfig {
 	// Determine if configured based on provider requirements
 	switch config.Provider.Value {
 	case "openai", "":
-		// For OpenAI, check if we have API key either in EMBEDDING_KEY or OPEN_AI_KEY
 		openaiKey, _ := c.GetVar("OPEN_AI_KEY")
-		config.Configured = config.APIKey.Value != "" || openaiKey.Value != ""
+		openaiURL, _ := c.GetVar("OPEN_AI_SERVER_URL")
+		config.Configured = config.APIKey.Value != "" ||
+			(openaiKey.Value != "" && isChatServer(config.URL.Value, openaiURL))
 	case "ollama":
-		// for Ollama, no API key required, but URL must be provided
-		config.Configured = config.URL.Value != ""
+		ollamaURL, _ := c.GetVar("OLLAMA_SERVER_URL")
+		config.Configured = config.URL.Value != "" || ollamaURL.Value != ""
+	case "mistral":
+		mistralKey, _ := c.GetVar("MISTRAL_API_KEY")
+		mistralURL, _ := c.GetVar("MISTRAL_SERVER_URL")
+		config.Configured = config.APIKey.Value != "" ||
+			(mistralKey.Value != "" && isChatServer(config.URL.Value, mistralURL))
 	case "huggingface", "googleai":
 		// These require API key
 		config.Configured = config.APIKey.Value != ""
@@ -1325,6 +1356,12 @@ func (c *controller) GetEmbedderConfig() *EmbedderConfig {
 	}
 
 	return config
+}
+
+// isChatServer mirrors the same-server rule of embeddingServer in pkg/providers/embeddings.
+func isChatServer(embeddingURL string, chatURL loader.EnvVar) bool {
+	return embeddingURL == "" ||
+		strings.TrimRight(embeddingURL, "/") == strings.TrimRight(cmp.Or(chatURL.Value, chatURL.Default), "/")
 }
 
 // UpdateEmbedderConfig updates embedder configuration
@@ -1389,6 +1426,7 @@ type AIAgentsConfig struct {
 	MaxGeneralAgentToolCalls       loader.EnvVar // MAX_GENERAL_AGENT_TOOL_CALLS
 	MaxLimitedAgentToolCalls       loader.EnvVar // MAX_LIMITED_AGENT_TOOL_CALLS
 	AgentPlanningStepEnabled       loader.EnvVar // AGENT_PLANNING_STEP_ENABLED
+	LLMFallbackProvider            loader.EnvVar // LLM_FALLBACK_PROVIDER
 }
 
 func (c *controller) GetAIAgentsConfig() *AIAgentsConfig {
@@ -1402,6 +1440,7 @@ func (c *controller) GetAIAgentsConfig() *AIAgentsConfig {
 	config.MaxGeneralAgentToolCalls, _ = c.GetVar("MAX_GENERAL_AGENT_TOOL_CALLS")
 	config.MaxLimitedAgentToolCalls, _ = c.GetVar("MAX_LIMITED_AGENT_TOOL_CALLS")
 	config.AgentPlanningStepEnabled, _ = c.GetVar("AGENT_PLANNING_STEP_ENABLED")
+	config.LLMFallbackProvider, _ = c.GetVar("LLM_FALLBACK_PROVIDER")
 
 	return config
 }
@@ -1435,6 +1474,9 @@ func (c *controller) UpdateAIAgentsConfig(config *AIAgentsConfig) error {
 	if err := c.SetVar("AGENT_PLANNING_STEP_ENABLED", config.AgentPlanningStepEnabled.Value); err != nil {
 		return fmt.Errorf("failed to set AGENT_PLANNING_STEP_ENABLED: %w", err)
 	}
+	if err := c.SetVar("LLM_FALLBACK_PROVIDER", config.LLMFallbackProvider.Value); err != nil {
+		return fmt.Errorf("failed to set LLM_FALLBACK_PROVIDER: %w", err)
+	}
 
 	return nil
 }
@@ -1443,6 +1485,7 @@ func (c *controller) ResetAIAgentsConfig() *AIAgentsConfig {
 	vars := []string{
 		"ASK_USER",
 		"ASSISTANT_USE_AGENTS",
+		"LLM_FALLBACK_PROVIDER",
 	}
 
 	if err := c.ResetVars(vars); err != nil {
@@ -1681,6 +1724,7 @@ type SearchEnginesConfig struct {
 	// perplexity extra settings
 	PerplexityModel       loader.EnvVar // PERPLEXITY_MODEL
 	PerplexityContextSize loader.EnvVar // PERPLEXITY_CONTEXT_SIZE
+	PerplexityTimeout     loader.EnvVar // PERPLEXITY_TIMEOUT
 
 	// searxng extra settings
 	SearxngURL        loader.EnvVar // SEARXNG_URL
@@ -1717,6 +1761,7 @@ func (c *controller) GetSearchEnginesConfig() *SearchEnginesConfig {
 	googleLRKey, _ := c.GetVar("GOOGLE_LR_KEY")
 	perplexityModel, _ := c.GetVar("PERPLEXITY_MODEL")
 	perplexityContextSize, _ := c.GetVar("PERPLEXITY_CONTEXT_SIZE")
+	perplexityTimeout, _ := c.GetVar("PERPLEXITY_TIMEOUT")
 	searxngURL, _ := c.GetVar("SEARXNG_URL")
 	searxngCategories, _ := c.GetVar("SEARXNG_CATEGORIES")
 	searxngLanguage, _ := c.GetVar("SEARXNG_LANGUAGE")
@@ -1736,6 +1781,7 @@ func (c *controller) GetSearchEnginesConfig() *SearchEnginesConfig {
 		PerplexityAPIKey:              perplexityAPIKey,
 		PerplexityModel:               perplexityModel,
 		PerplexityContextSize:         perplexityContextSize,
+		PerplexityTimeout:             perplexityTimeout,
 		TavilyAPIKey:                  tavilyAPIKey,
 		FirecrawlAPIKey:               firecrawlAPIKey,
 		FirecrawlAPIURL:               firecrawlAPIURL,
@@ -1825,6 +1871,9 @@ func (c *controller) UpdateSearchEnginesConfig(config *SearchEnginesConfig) erro
 	if err := c.SetVar("PERPLEXITY_CONTEXT_SIZE", config.PerplexityContextSize.Value); err != nil {
 		return fmt.Errorf("failed to set PERPLEXITY_CONTEXT_SIZE: %w", err)
 	}
+	if err := c.SetVar("PERPLEXITY_TIMEOUT", config.PerplexityTimeout.Value); err != nil {
+		return fmt.Errorf("failed to set PERPLEXITY_TIMEOUT: %w", err)
+	}
 	if err := c.SetVar("TAVILY_API_KEY", config.TavilyAPIKey.Value); err != nil {
 		return fmt.Errorf("failed to set TAVILY_API_KEY: %w", err)
 	}
@@ -1889,6 +1938,7 @@ func (c *controller) ResetSearchEnginesConfig() *SearchEnginesConfig {
 		"PERPLEXITY_API_KEY",
 		"PERPLEXITY_MODEL",
 		"PERPLEXITY_CONTEXT_SIZE",
+		"PERPLEXITY_TIMEOUT",
 		"TAVILY_API_KEY",
 		"FIRECRAWL_API_KEY",
 		"FIRECRAWL_API_URL",
@@ -1926,6 +1976,12 @@ type DockerConfig struct {
 	DockerWorkDir                loader.EnvVar // DOCKER_WORK_DIR
 	DockerDefaultImage           loader.EnvVar // DOCKER_DEFAULT_IMAGE
 	DockerDefaultImageForPentest loader.EnvVar // DOCKER_DEFAULT_IMAGE_FOR_PENTEST
+	DockerDefaultImageForTest    loader.EnvVar // DOCKER_DEFAULT_IMAGE_FOR_TEST
+	DockerImageSelectionMode     loader.EnvVar // DOCKER_IMAGE_SELECTION_MODE
+	DockerAllowedImages          loader.EnvVar // DOCKER_ALLOWED_IMAGES
+
+	// Sandbox self-test run at startup when DOCKER_INSIDE is enabled.
+	DockerInsidePolicyTests loader.EnvVar // DOCKER_INSIDE_POLICY_TESTS
 
 	// TLS connection settings (optional)
 	DockerHost         loader.EnvVar // DOCKER_HOST
@@ -1954,6 +2010,10 @@ func (c *controller) GetDockerConfig() *DockerConfig {
 		"DOCKER_WORK_DIR",
 		"DOCKER_DEFAULT_IMAGE",
 		"DOCKER_DEFAULT_IMAGE_FOR_PENTEST",
+		"DOCKER_DEFAULT_IMAGE_FOR_TEST",
+		"DOCKER_IMAGE_SELECTION_MODE",
+		"DOCKER_ALLOWED_IMAGES",
+		"DOCKER_INSIDE_POLICY_TESTS",
 		"DOCKER_HOST",
 		"DOCKER_TLS_VERIFY",
 		"PENTAGI_DOCKER_CERT_PATH",
@@ -1971,6 +2031,10 @@ func (c *controller) GetDockerConfig() *DockerConfig {
 		DockerWorkDir:                vars["DOCKER_WORK_DIR"],
 		DockerDefaultImage:           vars["DOCKER_DEFAULT_IMAGE"],
 		DockerDefaultImageForPentest: vars["DOCKER_DEFAULT_IMAGE_FOR_PENTEST"],
+		DockerDefaultImageForTest:    vars["DOCKER_DEFAULT_IMAGE_FOR_TEST"],
+		DockerImageSelectionMode:     vars["DOCKER_IMAGE_SELECTION_MODE"],
+		DockerAllowedImages:          vars["DOCKER_ALLOWED_IMAGES"],
+		DockerInsidePolicyTests:      vars["DOCKER_INSIDE_POLICY_TESTS"],
 		DockerHost:                   vars["DOCKER_HOST"],
 		DockerTLSVerify:              vars["DOCKER_TLS_VERIFY"],
 		HostDockerCertPath:           vars["PENTAGI_DOCKER_CERT_PATH"],
@@ -2004,6 +2068,10 @@ func (c *controller) UpdateDockerConfig(config *DockerConfig) error {
 		"DOCKER_WORK_DIR":                  config.DockerWorkDir.Value,
 		"DOCKER_DEFAULT_IMAGE":             config.DockerDefaultImage.Value,
 		"DOCKER_DEFAULT_IMAGE_FOR_PENTEST": config.DockerDefaultImageForPentest.Value,
+		"DOCKER_DEFAULT_IMAGE_FOR_TEST":    config.DockerDefaultImageForTest.Value,
+		"DOCKER_IMAGE_SELECTION_MODE":      config.DockerImageSelectionMode.Value,
+		"DOCKER_ALLOWED_IMAGES":            config.DockerAllowedImages.Value,
+		"DOCKER_INSIDE_POLICY_TESTS":       config.DockerInsidePolicyTests.Value,
 		"DOCKER_HOST":                      config.DockerHost.Value,
 		"DOCKER_TLS_VERIFY":                config.DockerTLSVerify.Value,
 		"PENTAGI_DOCKER_CERT_PATH":         config.HostDockerCertPath.Value,
@@ -2045,6 +2113,10 @@ func (c *controller) ResetDockerConfig() *DockerConfig {
 		"DOCKER_WORK_DIR",
 		"DOCKER_DEFAULT_IMAGE",
 		"DOCKER_DEFAULT_IMAGE_FOR_PENTEST",
+		"DOCKER_DEFAULT_IMAGE_FOR_TEST",
+		"DOCKER_IMAGE_SELECTION_MODE",
+		"DOCKER_ALLOWED_IMAGES",
+		"DOCKER_INSIDE_POLICY_TESTS",
 		"DOCKER_HOST",
 		"DOCKER_TLS_VERIFY",
 		"DOCKER_CERT_PATH",
@@ -2068,11 +2140,15 @@ type ServerSettingsConfig struct {
 	// direct form field mappings using loader.EnvVar
 	TenantID                 loader.EnvVar // TENANT_ID
 	LicenseKey               loader.EnvVar // LICENSE_KEY
+	UpdateStrategy           loader.EnvVar // UPDATE_STRATEGY
+	UpdateServerHost         loader.EnvVar // UPDATE_SERVER_HOST
+	SupportServerHost        loader.EnvVar // SUPPORT_SERVER_HOST
 	PprofAddr                loader.EnvVar // PPROF_ADDR
 	ListenIP                 loader.EnvVar // PENTAGI_LISTEN_IP
 	ListenPort               loader.EnvVar // PENTAGI_LISTEN_PORT
 	PublicURL                loader.EnvVar // PUBLIC_URL
 	CorsOrigins              loader.EnvVar // CORS_ORIGINS
+	TrustedProxies           loader.EnvVar // TRUSTED_PROXIES
 	CookieSigningSalt        loader.EnvVar // COOKIE_SIGNING_SALT
 	ProxyURL                 loader.EnvVar // PROXY_URL
 	HTTPClientTimeout        loader.EnvVar // HTTP_CLIENT_TIMEOUT
@@ -2094,11 +2170,15 @@ func (c *controller) GetServerSettingsConfig() *ServerSettingsConfig {
 	vars, _ := c.GetVars([]string{
 		"TENANT_ID",
 		"LICENSE_KEY",
+		"UPDATE_STRATEGY",
+		"UPDATE_SERVER_HOST",
+		"SUPPORT_SERVER_HOST",
 		"PPROF_ADDR",
 		"PENTAGI_LISTEN_IP",
 		"PENTAGI_LISTEN_PORT",
 		"PUBLIC_URL",
 		"CORS_ORIGINS",
+		"TRUSTED_PROXIES",
 		"COOKIE_SIGNING_SALT",
 		"PROXY_URL",
 		"HTTP_CLIENT_TIMEOUT",
@@ -2113,6 +2193,9 @@ func (c *controller) GetServerSettingsConfig() *ServerSettingsConfig {
 
 	defaults := map[string]string{
 		"LICENSE_KEY":                      "",
+		"UPDATE_STRATEGY":                  string(checker.DefaultUpdateStrategy),
+		"UPDATE_SERVER_HOST":               strings.TrimPrefix(strings.TrimSuffix(checker.DefaultUpdateServerEndpoint, "/"), "https://"),
+		"SUPPORT_SERVER_HOST":              strings.TrimPrefix(strings.TrimSuffix(checker.DefaultSupportServerEndpoint, "/"), "https://"),
 		"PPROF_ADDR":                       "",
 		"PENTAGI_LISTEN_IP":                "127.0.0.1",
 		"PENTAGI_LISTEN_PORT":              "8443",
@@ -2137,11 +2220,15 @@ func (c *controller) GetServerSettingsConfig() *ServerSettingsConfig {
 	cfg := &ServerSettingsConfig{
 		TenantID:                 vars["TENANT_ID"],
 		LicenseKey:               vars["LICENSE_KEY"],
+		UpdateStrategy:           vars["UPDATE_STRATEGY"],
+		UpdateServerHost:         vars["UPDATE_SERVER_HOST"],
+		SupportServerHost:        vars["SUPPORT_SERVER_HOST"],
 		PprofAddr:                vars["PPROF_ADDR"],
 		ListenIP:                 vars["PENTAGI_LISTEN_IP"],
 		ListenPort:               vars["PENTAGI_LISTEN_PORT"],
 		PublicURL:                vars["PUBLIC_URL"],
 		CorsOrigins:              vars["CORS_ORIGINS"],
+		TrustedProxies:           vars["TRUSTED_PROXIES"],
 		CookieSigningSalt:        vars["COOKIE_SIGNING_SALT"],
 		ProxyURL:                 vars["PROXY_URL"],
 		HTTPClientTimeout:        vars["HTTP_CLIENT_TIMEOUT"],
@@ -2181,11 +2268,15 @@ func (c *controller) UpdateServerSettingsConfig(config *ServerSettingsConfig) er
 	updates := map[string]string{
 		"TENANT_ID":                        config.TenantID.Value,
 		"LICENSE_KEY":                      config.LicenseKey.Value,
+		"UPDATE_STRATEGY":                  config.UpdateStrategy.Value,
+		"UPDATE_SERVER_HOST":               config.UpdateServerHost.Value,
+		"SUPPORT_SERVER_HOST":              config.SupportServerHost.Value,
 		"PPROF_ADDR":                       config.PprofAddr.Value,
 		"PENTAGI_LISTEN_IP":                config.ListenIP.Value,
 		"PENTAGI_LISTEN_PORT":              config.ListenPort.Value,
 		"PUBLIC_URL":                       config.PublicURL.Value,
 		"CORS_ORIGINS":                     config.CorsOrigins.Value,
+		"TRUSTED_PROXIES":                  config.TrustedProxies.Value,
 		"COOKIE_SIGNING_SALT":              config.CookieSigningSalt.Value,
 		"PROXY_URL":                        proxyURL,
 		"HTTP_CLIENT_TIMEOUT":              config.HTTPClientTimeout.Value,
@@ -2210,11 +2301,15 @@ func (c *controller) ResetServerSettingsConfig() *ServerSettingsConfig {
 	vars := []string{
 		"TENANT_ID",
 		"LICENSE_KEY",
+		"UPDATE_STRATEGY",
+		"UPDATE_SERVER_HOST",
+		"SUPPORT_SERVER_HOST",
 		"PPROF_ADDR",
 		"PENTAGI_LISTEN_IP",
 		"PENTAGI_LISTEN_PORT",
 		"PUBLIC_URL",
 		"CORS_ORIGINS",
+		"TRUSTED_PROXIES",
 		"COOKIE_SIGNING_SALT",
 		"PROXY_URL",
 		"HTTP_CLIENT_TIMEOUT",
@@ -2316,6 +2411,12 @@ func (c *controller) getVariableDescription(varName string) string {
 		"OPEN_AI_SERVER_URL":                locale.EnvDesc_OPEN_AI_SERVER_URL,
 		"ANTHROPIC_API_KEY":                 locale.EnvDesc_ANTHROPIC_API_KEY,
 		"ANTHROPIC_SERVER_URL":              locale.EnvDesc_ANTHROPIC_SERVER_URL,
+		"ANTHROPIC_ORGANIZATION_ID":         locale.EnvDesc_ANTHROPIC_ORGANIZATION_ID,
+		"ANTHROPIC_WORKSPACE_ID":            locale.EnvDesc_ANTHROPIC_WORKSPACE_ID,
+		"ANTHROPIC_SERVICE_ACCOUNT_ID":      locale.EnvDesc_ANTHROPIC_SERVICE_ACCOUNT_ID,
+		"ANTHROPIC_IDENTITY_TOKEN":          locale.EnvDesc_ANTHROPIC_IDENTITY_TOKEN,
+		"ANTHROPIC_IDENTITY_TOKEN_FILE":     locale.EnvDesc_ANTHROPIC_IDENTITY_TOKEN_FILE,
+		"ANTHROPIC_FEDERATION_RULE_ID":      locale.EnvDesc_ANTHROPIC_FEDERATION_RULE_ID,
 		"GEMINI_API_KEY":                    locale.EnvDesc_GEMINI_API_KEY,
 		"GEMINI_SERVER_URL":                 locale.EnvDesc_GEMINI_SERVER_URL,
 		"BEDROCK_DEFAULT_AUTH":              locale.EnvDesc_BEDROCK_DEFAULT_AUTH,
@@ -2325,6 +2426,7 @@ func (c *controller) getVariableDescription(varName string) string {
 		"BEDROCK_SESSION_TOKEN":             locale.EnvDesc_BEDROCK_SESSION_TOKEN,
 		"BEDROCK_REGION":                    locale.EnvDesc_BEDROCK_REGION,
 		"BEDROCK_SERVER_URL":                locale.EnvDesc_BEDROCK_SERVER_URL,
+		"BEDROCK_CONFIG_PATH":               locale.EnvDesc_BEDROCK_CONFIG_PATH,
 		"OLLAMA_SERVER_URL":                 locale.EnvDesc_OLLAMA_SERVER_URL,
 		"OLLAMA_SERVER_API_KEY":             locale.EnvDesc_OLLAMA_SERVER_API_KEY,
 		"OLLAMA_SERVER_MODEL":               locale.EnvDesc_OLLAMA_SERVER_MODEL,
@@ -2347,13 +2449,21 @@ func (c *controller) getVariableDescription(varName string) string {
 		"MINIMAX_API_KEY":                   locale.EnvDesc_MINIMAX_API_KEY,
 		"MINIMAX_SERVER_URL":                locale.EnvDesc_MINIMAX_SERVER_URL,
 		"MINIMAX_PROVIDER":                  locale.EnvDesc_MINIMAX_PROVIDER,
+		"MISTRAL_API_KEY":                   locale.EnvDesc_MISTRAL_API_KEY,
+		"MISTRAL_SERVER_URL":                locale.EnvDesc_MISTRAL_SERVER_URL,
+		"MISTRAL_PROVIDER":                  locale.EnvDesc_MISTRAL_PROVIDER,
+		"XAI_API_KEY":                       locale.EnvDesc_XAI_API_KEY,
+		"XAI_SERVER_URL":                    locale.EnvDesc_XAI_SERVER_URL,
+		"XAI_PROVIDER":                      locale.EnvDesc_XAI_PROVIDER,
 		"LLM_SERVER_URL":                    locale.EnvDesc_LLM_SERVER_URL,
 		"LLM_SERVER_KEY":                    locale.EnvDesc_LLM_SERVER_KEY,
 		"LLM_SERVER_MODEL":                  locale.EnvDesc_LLM_SERVER_MODEL,
 		"LLM_SERVER_CONFIG_PATH":            locale.EnvDesc_LLM_SERVER_CONFIG_PATH,
-		"LLM_SERVER_LEGACY_REASONING":       locale.EnvDesc_LLM_SERVER_LEGACY_REASONING,
 		"LLM_SERVER_PRESERVE_REASONING":     locale.EnvDesc_LLM_SERVER_PRESERVE_REASONING,
+		"LLM_SERVER_API_TYPE":               locale.EnvDesc_LLM_SERVER_API_TYPE,
+		"LLM_SERVER_API_VERSION":            locale.EnvDesc_LLM_SERVER_API_VERSION,
 		"LLM_SERVER_PROVIDER":               locale.EnvDesc_LLM_SERVER_PROVIDER,
+		"LLM_FALLBACK_PROVIDER":             locale.EnvDesc_LLM_FALLBACK_PROVIDER,
 
 		"LANGFUSE_LISTEN_IP":   locale.EnvDesc_LANGFUSE_LISTEN_IP,
 		"LANGFUSE_LISTEN_PORT": locale.EnvDesc_LANGFUSE_LISTEN_PORT,
@@ -2437,6 +2547,7 @@ func (c *controller) getVariableDescription(varName string) string {
 
 		"PERPLEXITY_MODEL":        locale.EnvDesc_PERPLEXITY_MODEL,
 		"PERPLEXITY_CONTEXT_SIZE": locale.EnvDesc_PERPLEXITY_CONTEXT_SIZE,
+		"PERPLEXITY_TIMEOUT":      locale.EnvDesc_PERPLEXITY_TIMEOUT,
 
 		"SEARXNG_URL":        locale.EnvDesc_SEARXNG_URL,
 		"SEARXNG_CATEGORIES": locale.EnvDesc_SEARXNG_CATEGORIES,
@@ -2453,6 +2564,10 @@ func (c *controller) getVariableDescription(varName string) string {
 		"DOCKER_WORK_DIR":                  locale.EnvDesc_DOCKER_WORK_DIR,
 		"DOCKER_DEFAULT_IMAGE":             locale.EnvDesc_DOCKER_DEFAULT_IMAGE,
 		"DOCKER_DEFAULT_IMAGE_FOR_PENTEST": locale.EnvDesc_DOCKER_DEFAULT_IMAGE_FOR_PENTEST,
+		"DOCKER_DEFAULT_IMAGE_FOR_TEST":    locale.EnvDesc_DOCKER_DEFAULT_IMAGE_FOR_TEST,
+		"DOCKER_IMAGE_SELECTION_MODE":      locale.EnvDesc_DOCKER_IMAGE_SELECTION_MODE,
+		"DOCKER_ALLOWED_IMAGES":            locale.EnvDesc_DOCKER_ALLOWED_IMAGES,
+		"DOCKER_INSIDE_POLICY_TESTS":       locale.EnvDesc_DOCKER_INSIDE_POLICY_TESTS,
 		"DOCKER_HOST":                      locale.EnvDesc_DOCKER_HOST,
 		"DOCKER_TLS_VERIFY":                locale.EnvDesc_DOCKER_TLS_VERIFY,
 		"DOCKER_CERT_PATH":                 locale.EnvDesc_DOCKER_CERT_PATH,
@@ -2467,6 +2582,7 @@ func (c *controller) getVariableDescription(varName string) string {
 		"PENTAGI_LISTEN_PORT":               locale.EnvDesc_PENTAGI_LISTEN_PORT,
 		"PUBLIC_URL":                        locale.EnvDesc_PUBLIC_URL,
 		"CORS_ORIGINS":                      locale.EnvDesc_CORS_ORIGINS,
+		"TRUSTED_PROXIES":                   locale.EnvDesc_TRUSTED_PROXIES,
 		"COOKIE_SIGNING_SALT":               locale.EnvDesc_COOKIE_SIGNING_SALT,
 		"PROXY_URL":                         locale.EnvDesc_PROXY_URL,
 		"EXTERNAL_SSL_CA_PATH":              locale.EnvDesc_EXTERNAL_SSL_CA_PATH,
@@ -2475,6 +2591,7 @@ func (c *controller) getVariableDescription(varName string) string {
 		"PENTAGI_DATA_DIR":                  locale.EnvDesc_PENTAGI_DATA_DIR,
 		"PENTAGI_DOCKER_SOCKET":             locale.EnvDesc_PENTAGI_DOCKER_SOCKET,
 		"PENTAGI_DOCKER_CERT_PATH":          locale.EnvDesc_PENTAGI_DOCKER_CERT_PATH,
+		"PENTAGI_BEDROCK_CONFIG_PATH":       locale.EnvDesc_PENTAGI_BEDROCK_CONFIG_PATH,
 		"PENTAGI_LLM_SERVER_CONFIG_PATH":    locale.EnvDesc_PENTAGI_LLM_SERVER_CONFIG_PATH,
 		"PENTAGI_OLLAMA_SERVER_CONFIG_PATH": locale.EnvDesc_PENTAGI_OLLAMA_SERVER_CONFIG_PATH,
 		"DATABASE_EXTENSIONS_SCHEMA":        locale.EnvDesc_DATABASE_EXTENSIONS_SCHEMA,
@@ -2529,8 +2646,10 @@ func (c *controller) getVariableDescription(varName string) string {
 // maskedVariables contains environment variable names that should be masked in display
 var maskedVariables = map[string]bool{
 	// API keys and Secrets
+	"LICENSE_KEY":               true,
 	"OPEN_AI_KEY":               true,
 	"ANTHROPIC_API_KEY":         true,
+	"ANTHROPIC_IDENTITY_TOKEN":  true,
 	"GEMINI_API_KEY":            true,
 	"BEDROCK_BEARER_TOKEN":      true,
 	"BEDROCK_ACCESS_KEY_ID":     true,
@@ -2542,6 +2661,8 @@ var maskedVariables = map[string]bool{
 	"KIMI_API_KEY":              true,
 	"QWEN_API_KEY":              true,
 	"MINIMAX_API_KEY":           true,
+	"MISTRAL_API_KEY":           true,
+	"XAI_API_KEY":               true,
 	"LLM_SERVER_KEY":            true,
 	"LANGFUSE_PUBLIC_KEY":       true,
 	"LANGFUSE_SECRET_KEY":       true,
@@ -2603,6 +2724,12 @@ var criticalVariables = map[string]bool{
 	"OPEN_AI_SERVER_URL":                true,
 	"ANTHROPIC_API_KEY":                 true,
 	"ANTHROPIC_SERVER_URL":              true,
+	"ANTHROPIC_ORGANIZATION_ID":         true,
+	"ANTHROPIC_WORKSPACE_ID":            true,
+	"ANTHROPIC_SERVICE_ACCOUNT_ID":      true,
+	"ANTHROPIC_IDENTITY_TOKEN":          true,
+	"ANTHROPIC_IDENTITY_TOKEN_FILE":     true,
+	"ANTHROPIC_FEDERATION_RULE_ID":      true,
 	"GEMINI_API_KEY":                    true,
 	"GEMINI_SERVER_URL":                 true,
 	"BEDROCK_DEFAULT_AUTH":              true,
@@ -2611,6 +2738,7 @@ var criticalVariables = map[string]bool{
 	"BEDROCK_SECRET_ACCESS_KEY":         true,
 	"BEDROCK_SESSION_TOKEN":             true,
 	"BEDROCK_REGION":                    true,
+	"BEDROCK_CONFIG_PATH":               true,
 	"OLLAMA_SERVER_URL":                 true,
 	"OLLAMA_SERVER_API_KEY":             true,
 	"OLLAMA_SERVER_MODEL":               true,
@@ -2633,13 +2761,19 @@ var criticalVariables = map[string]bool{
 	"MINIMAX_API_KEY":                   true,
 	"MINIMAX_SERVER_URL":                true,
 	"MINIMAX_PROVIDER":                  true,
+	"MISTRAL_API_KEY":                   true,
+	"MISTRAL_SERVER_URL":                true,
+	"MISTRAL_PROVIDER":                  true,
+	"XAI_API_KEY":                       true,
+	"XAI_SERVER_URL":                    true,
+	"XAI_PROVIDER":                      true,
 	"LLM_SERVER_URL":                    true,
 	"LLM_SERVER_KEY":                    true,
 	"LLM_SERVER_MODEL":                  true,
 	"LLM_SERVER_CONFIG_PATH":            true,
-	"LLM_SERVER_LEGACY_REASONING":       true,
 	"LLM_SERVER_PRESERVE_REASONING":     true,
 	"LLM_SERVER_PROVIDER":               true,
+	"LLM_FALLBACK_PROVIDER":             true,
 
 	// tools changes
 	"DUCKDUCKGO_ENABLED":      true,
@@ -2650,6 +2784,7 @@ var criticalVariables = map[string]bool{
 	"PERPLEXITY_API_KEY":      true,
 	"PERPLEXITY_MODEL":        true,
 	"PERPLEXITY_CONTEXT_SIZE": true,
+	"PERPLEXITY_TIMEOUT":      true,
 	"TAVILY_API_KEY":          true,
 	"FIRECRAWL_API_KEY":       true,
 	"FIRECRAWL_API_URL":       true,
@@ -2665,6 +2800,7 @@ var criticalVariables = map[string]bool{
 	"SEARXNG_TIMEOUT":         true,
 
 	// mounting custom LLM server config into pentagi container changes volume mapping
+	"PENTAGI_BEDROCK_CONFIG_PATH":       true,
 	"PENTAGI_LLM_SERVER_CONFIG_PATH":    true,
 	"PENTAGI_OLLAMA_SERVER_CONFIG_PATH": true,
 
@@ -2685,6 +2821,10 @@ var criticalVariables = map[string]bool{
 	"DOCKER_PUBLIC_IP":                 true,
 	"DOCKER_DEFAULT_IMAGE":             true,
 	"DOCKER_DEFAULT_IMAGE_FOR_PENTEST": true,
+	"DOCKER_DEFAULT_IMAGE_FOR_TEST":    true,
+	"DOCKER_IMAGE_SELECTION_MODE":      true,
+	"DOCKER_ALLOWED_IMAGES":            true,
+	"DOCKER_INSIDE_POLICY_TESTS":       true,
 	"DOCKER_HOST":                      true,
 	"DOCKER_TLS_VERIFY":                true,
 	"DOCKER_CERT_PATH":                 true,
@@ -2736,6 +2876,7 @@ var criticalVariables = map[string]bool{
 	"PENTAGI_LISTEN_PORT":              true,
 	"PUBLIC_URL":                       true,
 	"CORS_ORIGINS":                     true,
+	"TRUSTED_PROXIES":                  true,
 	"COOKIE_SIGNING_SALT":              true,
 	"PROXY_URL":                        true,
 	"EXTERNAL_SSL_CA_PATH":             true,

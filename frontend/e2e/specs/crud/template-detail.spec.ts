@@ -106,6 +106,7 @@ test.describe('template detail', { tag: '@coverage' }, () => {
 
         expect(variables.templateId).toBe(TEMPLATE_DETAIL.id);
         expect(variables.input.text).toContain('E2E-SAVE-MARK');
+        expect(variables.input.text, 'the line break the body ends with is sent').toMatch(/[^\n]\n$/);
 
         for (const atom of ['# Recon', '{{TARGET}}', 'nmap -sV']) {
             expect(variables.input.text, `"${atom}" survived the save`).toContain(atom);
@@ -127,6 +128,22 @@ test.describe('template detail', { tag: '@coverage' }, () => {
             await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
             await expect(page.getByText('Template not found')).toBeHidden();
             await expect(page).toHaveURL(new RegExp(`/templates/${TEMPLATE_DETAIL.id}$`));
+        });
+    });
+
+    test.describe('not found', () => {
+        test.use({
+            cassette: templateDetailCassette({
+                // Mirrors the backend error presenter's answer to a missing row (graphql_errors.go).
+                queries: { flowTemplate: [{ errors: [{ extensions: { code: 'NOT_FOUND' }, message: 'not found' }] }] },
+            }),
+        });
+
+        test('shows the not-found card, not Retry', async ({ page }) => {
+            await page.goto(`/templates/${TEMPLATE_DETAIL.id}`);
+
+            await expect(page.getByRole('heading', { name: 'Template not found' })).toBeVisible();
+            await expect(page.getByRole('button', { name: 'Try again' })).toBeHidden();
         });
     });
 });

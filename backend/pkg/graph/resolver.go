@@ -8,7 +8,9 @@ import (
 	"pentagi/pkg/graph/subscriptions"
 	"pentagi/pkg/providers"
 	"pentagi/pkg/server/auth"
+	"pentagi/pkg/server/update"
 	"pentagi/pkg/templates"
+	"pentagi/pkg/timezone"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vxcontrol/cloud/anonymizer"
@@ -29,4 +31,6 @@ type Resolver struct {
 	Subscriptions   subscriptions.SubscriptionsController
 	Knowledge       knowledge.KnowledgeStore
 	Replacer        anonymizer.Replacer
+	Updates         *update.Service
+	Timezones       *timezone.Catalog
 }

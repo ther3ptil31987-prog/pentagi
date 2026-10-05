@@ -64,6 +64,15 @@ describe('formValuesToCreateInput', () => {
     });
 });
 
+describe('the content a form value carries', () => {
+    it('reaches both inputs as it was written', () => {
+        const values = { ...baseValues, content: '  # Title\n\ntext\n' };
+
+        expect(formValuesToCreateInput(values).content).toBe('  # Title\n\ntext\n');
+        expect(formValuesToUpdateInput(values, {}).content).toBe('  # Title\n\ntext\n');
+    });
+});
+
 describe('formValuesToUpdateInput', () => {
     it('always sends content and omits untouched fields', () => {
         const input = formValuesToUpdateInput(baseValues, {});
@@ -148,11 +157,49 @@ describe('formSchema', () => {
         expect(result.error?.issues.find((i) => i.path[0] === 'content')?.message).toBe('Content is required');
     });
 
+    it.each([
+        ['spaces', '   '],
+        ['line breaks and tabs', '\n\t \n'],
+    ])('refuses a content of nothing but %s', (_name, content) => {
+        const result = formSchema.safeParse({ ...valid, content });
+
+        expect(result.error?.issues.find((i) => i.path[0] === 'content')?.message).toBe('Content is required');
+    });
+
+    it('hands the content on as it was written and trims the one-line fields', () => {
+        const result = formSchema.safeParse({
+            ...valid,
+            codeLang: ' go ',
+            content: '  # Title\n\ntext\n',
+            description: ' about ',
+            question: '  which port?  ',
+        });
+
+        expect(result.data).toMatchObject({
+            codeLang: 'go',
+            content: '  # Title\n\ntext\n',
+            description: 'about',
+            question: 'which port?',
+        });
+    });
+
+    it('counts the line break a content ends with toward its limit', () => {
+        expect(formSchema.safeParse({ ...valid, content: `${'a'.repeat(65536)}\n` }).success).toBe(false);
+    });
+
     it('requires question', () => {
         const result = formSchema.safeParse({ ...valid, question: '' });
 
         expect(result.success).toBe(false);
         expect(result.error?.issues.find((i) => i.path[0] === 'question')?.message).toBe('Question is required');
+    });
+
+    it.each([
+        ['question', 2048],
+        ['content', 65536],
+    ] as const)('counts %s length in code points, the way the endpoint does', (field, max) => {
+        expect(formSchema.safeParse({ ...valid, [field]: '\u{1f511}'.repeat(max) }).success).toBe(true);
+        expect(formSchema.safeParse({ ...valid, [field]: '\u{1f511}'.repeat(max + 1) }).success).toBe(false);
     });
 
     it('enforces the question max-length message', () => {

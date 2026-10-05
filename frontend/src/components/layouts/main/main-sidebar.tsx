@@ -24,6 +24,8 @@ import type { Flow } from '@/providers/sidebar-flows-provider';
 import type { Theme } from '@/providers/theme-provider';
 
 import Logo from '@/components/icons/logo';
+import { VersionPanel } from '@/components/shared/version-panel';
+import { Badge } from '@/components/ui/badge';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -50,6 +52,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useResourcesUpload } from '@/features/resources/use-resources-upload';
 import { useTheme } from '@/hooks/use-theme';
 import { routes } from '@/lib/routes';
+import { formatAccountProvider } from '@/lib/utils/format';
 import { useFavorites } from '@/providers/favorites-provider';
 import { useSidebarFlows } from '@/providers/sidebar-flows-provider';
 import { useUser } from '@/providers/user-provider';
@@ -58,6 +61,7 @@ interface FlowMenuItemProps {
     activeFlowId: null | number;
     flow: Flow;
     isFavorite: boolean;
+    isToggleShown: boolean;
     onToggleFavorite: (flowId: string) => void;
 }
 
@@ -74,7 +78,7 @@ export function MainSidebar() {
     const { authInfo, logout } = useUser();
     const user = authInfo?.user;
     const { setTheme, theme } = useTheme();
-    const { addFavoriteFlow, favoriteFlowIds, removeFavoriteFlow } = useFavorites();
+    const { addFavoriteFlow, canToggleFavorite, favoriteFlowIds, removeFavoriteFlow } = useFavorites();
     const { flows } = useSidebarFlows();
 
     const resourcesUpload = useResourcesUpload();
@@ -102,13 +106,11 @@ export function MainSidebar() {
         <Sidebar collapsible="icon">
             <SidebarHeader>
                 <SidebarMenu>
-                    <SidebarMenuItem className="flex items-center gap-2">
-                        <div className="flex aspect-square size-8 items-center justify-center">
-                            <Logo className="hover:animate-logo-spin size-6" />
-                        </div>
-                        <div className="grid flex-1 text-left leading-tight">
-                            <span className="truncate font-semibold">PentAGI</span>
-                        </div>
+                    <SidebarMenuItem>
+                        <VersionPanel
+                            icon={<Logo className="hover:animate-logo-spin size-8" />}
+                            title="PentAGI"
+                        />
                     </SidebarMenuItem>
                 </SidebarMenu>
             </SidebarHeader>
@@ -241,6 +243,7 @@ export function MainSidebar() {
                                         activeFlowId={flowId}
                                         flow={flow}
                                         isFavorite={false}
+                                        isToggleShown={canToggleFavorite(flow)}
                                         key={flow.id}
                                         onToggleFavorite={addFavoriteFlow}
                                     />
@@ -263,6 +266,7 @@ export function MainSidebar() {
                                         activeFlowId={flowId}
                                         flow={flow}
                                         isFavorite
+                                        isToggleShown
                                         key={flow.id}
                                         onToggleFavorite={removeFavoriteFlow}
                                     />
@@ -320,13 +324,18 @@ export function MainSidebar() {
                                                 <UserIcon className="size-4" />
                                             </AvatarFallback>
                                         </Avatar>
-                                        <div className="grid flex-1 text-left text-sm leading-tight">
+                                        <div className="grid min-w-0 flex-1 text-left text-sm leading-tight">
                                             <span className="truncate font-semibold">{user?.name}</span>
                                             <span className="truncate text-xs">{user?.mail}</span>
-                                            <span className="text-muted-foreground truncate text-xs">
-                                                {user?.type === 'local' ? 'local' : 'oauth'}
-                                            </span>
                                         </div>
+                                        <Badge
+                                            className="shrink-0"
+                                            variant="secondary"
+                                        >
+                                            {user?.type === 'local'
+                                                ? 'Local'
+                                                : (formatAccountProvider(user?.provider) ?? 'OAuth')}
+                                        </Badge>
                                     </div>
                                 </DropdownMenuLabel>
                                 <DropdownMenuSeparator />
@@ -402,7 +411,7 @@ export function MainSidebar() {
     );
 }
 
-function FlowMenuItem({ activeFlowId, flow, isFavorite, onToggleFavorite }: FlowMenuItemProps) {
+function FlowMenuItem({ activeFlowId, flow, isFavorite, isToggleShown, onToggleFavorite }: FlowMenuItemProps) {
     return (
         <SidebarMenuItem>
             <SidebarMenuButton
@@ -419,15 +428,17 @@ function FlowMenuItem({ activeFlowId, flow, isFavorite, onToggleFavorite }: Flow
                     <span className="truncate">{flow.title}</span>
                 </Link>
             </SidebarMenuButton>
-            <SidebarMenuAction
-                aria-label="Toggle favorite"
-                aria-pressed={isFavorite}
-                className="data-[state=open]:bg-accent rounded-sm"
-                onClick={() => onToggleFavorite(flow.id)}
-                showOnHover
-            >
-                <Star className={isFavorite ? 'fill-yellow-500 stroke-yellow-500' : ''} />
-            </SidebarMenuAction>
+            {isToggleShown && (
+                <SidebarMenuAction
+                    aria-label="Toggle favorite"
+                    aria-pressed={isFavorite}
+                    className="data-[state=open]:bg-accent rounded-sm"
+                    onClick={() => onToggleFavorite(flow.id)}
+                    showOnHover
+                >
+                    <Star className={isFavorite ? 'fill-yellow-500 stroke-yellow-500' : ''} />
+                </SidebarMenuAction>
+            )}
         </SidebarMenuItem>
     );
 }

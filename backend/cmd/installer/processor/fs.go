@@ -14,18 +14,29 @@ import (
 )
 
 const (
-	observabilityDirectory        = "observability"
-	graphitiConfigsDirectory      = "graphiti"
-	neo4jDirectory                = "neo4j"
-	pentagiExampleCustomConfigLLM = "example.custom.provider.yml"
-	pentagiExampleOllamaConfigLLM = "example.ollama.provider.yml"
+	observabilityDirectory         = "observability"
+	graphitiConfigsDirectory       = "graphiti"
+	neo4jDirectory                 = "neo4j"
+	pentagiExampleCustomConfigLLM  = "example.custom.provider.yml"
+	pentagiExampleOllamaConfigLLM  = "example.ollama.provider.yml"
+	pentagiExampleBedrockConfigLLM = "example.bedrock.provider.yml"
 )
+
+// pentagiExampleConfigs are the default sources of the provider config mounts in
+// docker-compose.yml. Each has to be on disk as a file before the stack starts:
+// Docker creates a directory in place of a bind-mount source that is missing.
+var pentagiExampleConfigs = []string{
+	pentagiExampleCustomConfigLLM,
+	pentagiExampleOllamaConfigLLM,
+	pentagiExampleBedrockConfigLLM,
+}
 
 var filesToExcludeFromVerification = []string{
 	"observability/otel/config.yml",
 	"observability/grafana/config/grafana.ini",
 	pentagiExampleCustomConfigLLM,
 	pentagiExampleOllamaConfigLLM,
+	pentagiExampleBedrockConfigLLM,
 	// user-editable Neo4j/APOC static settings: created once if missing, never
 	// overwritten afterwards, even when the user forces a files update
 	"neo4j/conf/neo4j.conf",
@@ -35,6 +46,20 @@ var filesToExcludeFromVerification = []string{
 	"graphiti/gemini.yaml",
 	"graphiti/litellm.yaml",
 	"graphiti/openai.yaml",
+	// The Jaeger storage plugin is updated over the network, so the embedded copy and the
+	// cloud are two sources of truth for one path and the priority has to be declared.
+	// Without this the update undoes itself: a downloaded plugin differs from what the
+	// installer ships, so verifyDirectoryContentIntegrity calls it modified. On every
+	// Apply Changes the user is then offered a "repair" — an offer to roll the update
+	// back, dressed up as tidying — and answering yes sets force, which copies the
+	// embedded version straight over the downloaded one. Factory reset does the same
+	// without asking.
+	//
+	// The exclusion policy is exactly the one this needs: still created when missing, so
+	// the embedded copy remains the source for a first install, and never overwritten
+	// afterwards, so the cloud becomes the source once it has answered.
+	"observability/jaeger/bin/jaeger-clickhouse-linux-amd64",
+	"observability/jaeger/bin/jaeger-clickhouse-linux-arm64",
 }
 
 var allStacks = []ProductStack{
@@ -58,10 +83,11 @@ func (fs *fileSystemOperationsImpl) ensureStackIntegrity(ctx context.Context, st
 
 	switch stack {
 	case ProductStackPentagi:
-		errCompose := fs.ensureFileFromEmbed(composeFilePentagi, state)
-		errCustom := fs.ensureFileFromEmbed(pentagiExampleCustomConfigLLM, state)
-		errOllama := fs.ensureFileFromEmbed(pentagiExampleOllamaConfigLLM, state)
-		return errors.Join(errCompose, errCustom, errOllama)
+		errs := []error{fs.ensureFileFromEmbed(composeFilePentagi, state)}
+		for _, name := range pentagiExampleConfigs {
+			errs = append(errs, fs.ensureFileFromEmbed(name, state))
+		}
+		return errors.Join(errs...)
 
 	case ProductStackGraphiti:
 		errCompose := fs.ensureFileFromEmbed(composeFileGraphiti, state)
@@ -97,7 +123,11 @@ func (fs *fileSystemOperationsImpl) verifyStackIntegrity(ctx context.Context, st
 
 	switch stack {
 	case ProductStackPentagi:
-		return fs.verifyFileIntegrity(composeFilePentagi, state)
+		if err := fs.verifyFileIntegrity(composeFilePentagi, state); err != nil {
+			return err
+		}
+		fs.restoreExampleConfigs(state)
+		return nil
 
 	case ProductStackGraphiti:
 		if err := fs.verifyFileIntegrity(composeFileGraphiti, state); err != nil {
@@ -131,7 +161,8 @@ func (fs *fileSystemOperationsImpl) verifyStackIntegrity(ctx context.Context, st
 	}
 }
 
-// checkStackIntegrity is a silent version of verifyStackIntegrity, used for getting files statuses
+// checkStackIntegrity is the read-only counterpart of verifyStackIntegrity; it does not report
+// the provider examples verifyStackIntegrity restores for pentagi.
 func (fs *fileSystemOperationsImpl) checkStackIntegrity(ctx context.Context, stack ProductStack) (FilesCheckResult, error) {
 	result := make(FilesCheckResult)
 
@@ -190,8 +221,9 @@ func (fs *fileSystemOperationsImpl) cleanupStackFiles(ctx context.Context, stack
 	switch stack {
 	case ProductStackPentagi:
 		filesToRemove = append(filesToRemove, filepath.Join(workingDir, composeFilePentagi))
-		filesToRemove = append(filesToRemove, filepath.Join(workingDir, pentagiExampleCustomConfigLLM))
-		filesToRemove = append(filesToRemove, filepath.Join(workingDir, pentagiExampleOllamaConfigLLM))
+		for _, name := range pentagiExampleConfigs {
+			filesToRemove = append(filesToRemove, filepath.Join(workingDir, name))
+		}
 
 	case ProductStackGraphiti:
 		filesToRemove = append(filesToRemove, filepath.Join(workingDir, composeFileGraphiti))
@@ -243,6 +275,26 @@ func (fs *fileSystemOperationsImpl) ensureFileFromEmbed(filename string, state *
 	}
 
 	return fs.processor.files.Copy(filename, workingDir, true)
+}
+
+// restoreExampleConfigs writes a provider example that is not on disk as a file,
+// which covers the directory Docker left in its place, and never touches one that
+// is, whatever state.force says: on a stack already extracted the examples are the
+// user's. A failure is logged and not returned: the stack starts without the file,
+// over the directory Docker makes for it.
+func (fs *fileSystemOperationsImpl) restoreExampleConfigs(state *operationState) {
+	workingDir := filepath.Dir(fs.processor.state.GetEnvPath())
+
+	for _, name := range pentagiExampleConfigs {
+		if fs.fileExists(filepath.Join(workingDir, name)) {
+			continue
+		}
+
+		fs.processor.appendLog(fmt.Sprintf(MsgCreatingMissingFile, name), ProductStackAll, state)
+		if err := fs.processor.files.Copy(name, workingDir, true); err != nil {
+			fs.processor.appendLog(fmt.Sprintf(MsgMissingFileNotCreated, name, err), ProductStackAll, state)
+		}
+	}
 }
 
 func (fs *fileSystemOperationsImpl) ensureDirectoryFromEmbed(dirname string, state *operationState) error {

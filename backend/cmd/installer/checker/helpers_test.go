@@ -2,121 +2,55 @@ package checker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"pentagi/cmd/installer/loader"
 	"pentagi/cmd/installer/state"
+
+	"github.com/moby/moby/client"
 )
 
-type mockState struct {
-	vars    map[string]loader.EnvVar
-	envPath string
-}
-
-func (m *mockState) GetVar(key string) (loader.EnvVar, bool) {
-	if val, exists := m.vars[key]; exists {
-		return val, true
-	}
-	return loader.EnvVar{}, false
-}
-
-func (m *mockState) GetVars(names []string) (map[string]loader.EnvVar, map[string]bool) {
-	return m.vars, make(map[string]bool, len(names))
-}
-
-func (m *mockState) GetEnvPath() string {
-	return m.envPath
-}
-
-func (m *mockState) Exists() bool                         { return true }
-func (m *mockState) Reset() error                         { return nil }
-func (m *mockState) Commit() error                        { return nil }
-func (m *mockState) IsDirty() bool                        { return false }
-func (m *mockState) GetEulaConsent() bool                 { return true }
-func (m *mockState) SetEulaConsent() error                { return nil }
-func (m *mockState) SetStack(stack []string) error        { return nil }
-func (m *mockState) GetStack() []string                   { return []string{} }
-func (m *mockState) SetVar(name, value string) error      { return nil }
-func (m *mockState) ResetVar(name string) error           { return nil }
-func (m *mockState) SetVars(vars map[string]string) error { return nil }
-func (m *mockState) ResetVars(names []string) error       { return nil }
-func (m *mockState) GetAllVars() map[string]loader.EnvVar { return m.vars }
-
-func TestCheckFileExistsAndReadable(t *testing.T) {
-	f, err := os.CreateTemp("", "testfile")
-	if err != nil {
+// Covers checkFileExists and checkFileIsReadable on the same file before and after removal.
+func TestHelpers_CheckFile_TellsAReadableFileFromAMissingOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(path, []byte("test content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-
-	if !checkFileExists(f.Name()) {
-		t.Errorf("file should exist")
-	}
-	if !checkFileIsReadable(f.Name()) {
-		t.Errorf("file should be readable")
+	if !checkFileExists(path) || !checkFileIsReadable(path) {
+		t.Errorf("an existing file: exists=%t readable=%t, want both", checkFileExists(path), checkFileIsReadable(path))
 	}
 
-	os.Remove(f.Name())
-	if checkFileExists(f.Name()) {
-		t.Errorf("file should not exist")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
 	}
-	if checkFileIsReadable(f.Name()) {
-		t.Errorf("removed file should not be readable")
+	for _, missing := range []string{path, "", "/nonexistent/path/file.txt"} {
+		if checkFileExists(missing) {
+			t.Errorf("%q is reported to exist", missing)
+		}
 	}
-
-	if checkFileExists("") {
-		t.Errorf("empty path should not exist")
-	}
-	if checkFileExists("/nonexistent/path/file.txt") {
-		t.Errorf("nonexistent file should not exist")
+	if checkFileIsReadable(path) {
+		t.Error("a removed file is reported readable")
 	}
 }
 
-func TestGetEnvVar(t *testing.T) {
+func TestHelpers_GetEnvVar_FallsBackFromTheValueToTheDefaults(t *testing.T) {
 	tests := []struct {
-		name         string
-		vars         map[string]loader.EnvVar
-		key          string
-		defaultValue string
-		expected     string
+		name string
+		vars map[string]loader.EnvVar // nil means no state at all
+		want string
 	}{
-		{
-			name:         "existing variable",
-			vars:         map[string]loader.EnvVar{"FOO": {Value: "bar"}},
-			key:          "FOO",
-			defaultValue: "default",
-			expected:     "bar",
-		},
-		{
-			name:         "non-existing variable",
-			vars:         map[string]loader.EnvVar{},
-			key:          "MISSING",
-			defaultValue: "default",
-			expected:     "default",
-		},
-		{
-			name:         "empty variable value",
-			vars:         map[string]loader.EnvVar{"EMPTY": {Value: ""}},
-			key:          "EMPTY",
-			defaultValue: "default",
-			expected:     "default",
-		},
-		{
-			name:         "nil state",
-			vars:         nil,
-			key:          "ANY",
-			defaultValue: "default",
-			expected:     "default",
-		},
+		{"a set value", map[string]loader.EnvVar{"FOO": {Value: "bar"}}, "bar"},
+		{"an absent variable", map[string]loader.EnvVar{}, "fallback"},
+		{"an empty value", map[string]loader.EnvVar{"FOO": {Value: ""}}, "fallback"},
+		{"an empty value with a config default", map[string]loader.EnvVar{"FOO": {Default: "configured"}}, "configured"},
+		{"no state", nil, "fallback"},
 	}
 
 	for _, tt := range tests {
@@ -125,107 +59,62 @@ func TestGetEnvVar(t *testing.T) {
 			if tt.vars != nil {
 				appState = &mockState{vars: tt.vars}
 			}
-
-			result := getEnvVar(appState, tt.key, tt.defaultValue)
-			if result != tt.expected {
-				t.Errorf("getEnvVar() = %q, want %q", result, tt.expected)
+			if got := getEnvVar(appState, "FOO", "fallback"); got != tt.want {
+				t.Errorf("getEnvVar = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestExtractVersionFromOutput(t *testing.T) {
+func TestHelpers_ExtractVersionFromOutput_FindsTheFirstSemanticVersion(t *testing.T) {
+	for input, want := range map[string]string{
+		"docker-compose version 1.29.2, build 5becea4c": "1.29.2",
+		"Docker Compose version v2.12.2":                "2.12.2",
+		"v1.0.0-alpha":                                  "1.0.0",
+		"no version here":                               "",
+		"":                                              "",
+	} {
+		if got := extractVersionFromOutput(input); got != want {
+			t.Errorf("extractVersionFromOutput(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestHelpers_CheckDockerComposeVersionWithRunner_ReadsTheVersionFromStdout(t *testing.T) {
 	tests := []struct {
-		input    string
-		expected string
+		name   string
+		output string
+		err    error
+		want   DockerVersion
 	}{
-		{"docker-compose version 1.29.2, build 5becea4c", "1.29.2"},
-		{"Docker Compose version v2.12.2", "2.12.2"},
-		{"Docker version 20.10.8, build 3967b7d", "20.10.8"},
-		{"no version here", ""},
-		{"v1.0.0-alpha", "1.0.0"},
-		{"version: 3.14.159", "3.14.159"},
-		{"", ""},
+		{"docker compose v2", "Docker Compose version v2.12.2", nil, DockerVersion{Version: "2.12.2", Valid: true}},
+		{"a version on stdout survives a failing exit", "Docker Compose version v2.12.2", errors.New("exit status 1"),
+			DockerVersion{Version: "2.12.2", Valid: true}},
+		{"docker compose is unavailable", "", errors.New("executable file not found"), DockerVersion{}},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("input_%s", tt.input), func(t *testing.T) {
-			result := extractVersionFromOutput(tt.input)
-			if result != tt.expected {
-				t.Errorf("extractVersionFromOutput(%q) = %q, want %q", tt.input, result, tt.expected)
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			got := checkDockerComposeVersionWithRunner(func(name string, args ...string) ([]byte, error) {
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				return []byte(tt.output), tt.err
+			})
+
+			if len(calls) != 1 || calls[0] != "docker compose version" {
+				t.Errorf("ran %q, want one docker compose version", calls)
+			}
+			if got != tt.want {
+				t.Errorf("got %+v, want %+v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestCheckDockerComposeVersionWithRunner(t *testing.T) {
-	t.Run("uses docker compose v2 output", func(t *testing.T) {
-		calls := 0
-		result := checkDockerComposeVersionWithRunner(func(name string, args ...string) ([]byte, error) {
-			calls++
-			if name != "docker" {
-				t.Fatalf("unexpected command %q", name)
-			}
-			if len(args) != 2 || args[0] != "compose" || args[1] != "version" {
-				t.Fatalf("unexpected args: %v", args)
-			}
-
-			return []byte("Docker Compose version v2.12.2"), nil
-		})
-
-		if calls != 1 {
-			t.Fatalf("expected 1 command invocation, got %d", calls)
-		}
-		if result.Version != "2.12.2" {
-			t.Fatalf("expected version 2.12.2, got %q", result.Version)
-		}
-		if !result.Valid {
-			t.Fatal("expected docker compose version to be valid")
-		}
-	})
-
-	t.Run("parses version from stdout even when error is returned", func(t *testing.T) {
-		calls := 0
-		result := checkDockerComposeVersionWithRunner(func(name string, args ...string) ([]byte, error) {
-			calls++
-			return []byte("Docker Compose version v2.12.2"), errors.New("exit status 1")
-		})
-
-		if calls != 1 {
-			t.Fatalf("expected 1 command invocation, got %d", calls)
-		}
-		if result.Version != "2.12.2" {
-			t.Fatalf("expected version 2.12.2, got %q", result.Version)
-		}
-		if !result.Valid {
-			t.Fatal("expected docker compose version to remain valid when stdout is parseable")
-		}
-	})
-
-	t.Run("fails when docker compose is unavailable", func(t *testing.T) {
-		calls := 0
-		result := checkDockerComposeVersionWithRunner(func(name string, args ...string) ([]byte, error) {
-			calls++
-			return nil, errors.New("executable file not found")
-		})
-
-		if calls != 1 {
-			t.Fatalf("expected 1 command invocation, got %d", calls)
-		}
-		if result.Version != "" {
-			t.Fatalf("expected empty version, got %q", result.Version)
-		}
-		if result.Valid {
-			t.Fatal("expected docker compose check to be invalid")
-		}
-	})
-}
-
-func TestCheckVersionCompatibility(t *testing.T) {
+func TestHelpers_CheckVersionCompatibility_ComparesPartByPart(t *testing.T) {
 	tests := []struct {
-		version    string
-		minVersion string
-		expected   bool
+		version, minVersion string
+		want                bool
 	}{
 		{"1.2.3", "1.2.0", true},
 		{"1.2.0", "1.2.0", true},
@@ -236,604 +125,265 @@ func TestCheckVersionCompatibility(t *testing.T) {
 		{"1.0.0", "", false},
 		{"invalid", "1.0.0", false},
 		{"1.0.0", "invalid", false},
-		{"1.2", "1.2.0", false}, // fewer parts should fail
-		{"1.2.0", "1.2", true},  // more parts should pass
+		{"1.2", "1.2.0", false},
+		{"1.2.0", "1.2", true},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s_vs_%s", tt.version, tt.minVersion), func(t *testing.T) {
-			result := checkVersionCompatibility(tt.version, tt.minVersion)
-			if result != tt.expected {
-				t.Errorf("checkVersionCompatibility(%q, %q) = %v, want %v",
-					tt.version, tt.minVersion, result, tt.expected)
-			}
-		})
+		if got := checkVersionCompatibility(tt.version, tt.minVersion); got != tt.want {
+			t.Errorf("checkVersionCompatibility(%q, %q) = %t, want %t", tt.version, tt.minVersion, got, tt.want)
+		}
 	}
 }
 
-func TestParseImageRef(t *testing.T) {
+func TestHelpers_ParseImageRef_SplitsTheReferenceTheUpdateServerMatches(t *testing.T) {
 	tests := []struct {
-		imageRef string
-		imageID  string
-		wantName string
-		wantTag  string
-		wantHash string
+		imageRef, imageID, wantName, wantTag, wantHash string
 	}{
 		{"alpine:3.18", "sha256:abc", "alpine", "3.18", "sha256:abc"},
 		{"nginx", "", "nginx", "latest", ""},
 		{"nginx", "sha256:def", "nginx", "latest", "sha256:def"},
 		{"repo/nginx:1.2", "", "repo/nginx", "1.2", ""},
-		{"docker.io/library/ubuntu:latest", "", "library/ubuntu", "latest", ""},
+		{"docker.io/library/ubuntu:latest", "", "ubuntu", "latest", ""},
 		{"nginx@sha256:deadbeef", "", "nginx", "latest", "sha256:deadbeef"},
-		{"myreg:5000/foo/bar:tag@sha256:beef", "", "foo/bar", "tag", "sha256:beef"},
-		{"localhost:5000/myapp:v1.0", "", "myapp", "v1.0", ""},
-		{"registry.example.com/team/app", "", "team/app", "latest", ""},
-		{"", "", "", "", ""},
+		// Anywhere but Docker Hub the host is part of the name.
+		{"myreg:5000/foo/bar:tag@sha256:beef", "", "myreg:5000/foo/bar", "tag", "sha256:beef"},
+		{"localhost:5000/myapp:v1.0", "", "localhost:5000/myapp", "v1.0", ""},
+		{"localhost:5000/myapp", "", "localhost:5000/myapp", "latest", ""},
+		{"registry.example.com/team/app", "", "registry.example.com/team/app", "latest", ""},
+		{"gcr.io/cadvisor/cadvisor:v0.51.0", "", "gcr.io/cadvisor/cadvisor", "v0.51.0", ""},
+		{"index.docker.io/library/redis:7", "", "redis", "7", ""},
+		{"registry-1.docker.io/prom/node-exporter:v1.8.2", "", "prom/node-exporter", "v1.8.2", ""},
 		{"ubuntu:", "", "ubuntu", "latest", ""},
 		{"ubuntu:@sha256:hash", "", "ubuntu", "latest", "sha256:hash"},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("parse_%s", tt.imageRef), func(t *testing.T) {
-			if tt.imageRef == "" {
-				info := parseImageRef(tt.imageRef, tt.imageID)
-				if info != nil {
-					t.Errorf("parseImageRef(%q) should return nil for empty input", tt.imageRef)
+		info := parseImageRef(tt.imageRef, tt.imageID)
+		if info == nil {
+			t.Errorf("parseImageRef(%q) = nil", tt.imageRef)
+			continue
+		}
+		if *info != (ImageInfo{Name: tt.wantName, Tag: tt.wantTag, Hash: tt.wantHash}) {
+			t.Errorf("parseImageRef(%q) = %+v, want %s:%s hash %q", tt.imageRef, *info, tt.wantName, tt.wantTag, tt.wantHash)
+		}
+	}
+	if info := parseImageRef("", ""); info != nil {
+		t.Errorf("parseImageRef of an empty reference = %+v, want nil", info)
+	}
+}
+
+func TestHelpers_ParseImageRef_SplitsEveryShippedComposeImageIntoAMatchablePair(t *testing.T) {
+	for _, path := range composeFiles {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		for _, line := range strings.Split(string(content), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "image:") {
+				continue
+			}
+			ref := strings.TrimSpace(strings.TrimPrefix(trimmed, "image:"))
+			// The default inside `${X_IMAGE:-default}` is what a fresh installation pulls.
+			if inner, found := strings.CutPrefix(ref, "${"); found {
+				if _, def, ok := strings.Cut(strings.TrimSuffix(inner, "}"), ":-"); ok {
+					ref = def
 				}
-				return
 			}
 
-			info := parseImageRef(tt.imageRef, tt.imageID)
+			info := parseImageRef(ref, "")
 			if info == nil {
-				t.Errorf("parseImageRef(%q) = nil, want non-nil", tt.imageRef)
-				return
+				t.Errorf("%s: %q did not parse at all", filepath.Base(path), ref)
+				continue
 			}
-
-			// note: current implementation has some edge cases with registry parsing
-			// we test for non-nil result and basic structure rather than exact parsing
-			if info.Name == "" {
-				t.Errorf("parseImageRef(%q).Name should not be empty", tt.imageRef)
+			if strings.Contains(info.Name, ":") {
+				t.Errorf("%s: %q parsed to repository %q, the tag was swallowed into the name", filepath.Base(path), ref, info.Name)
 			}
-			if info.Tag == "" {
-				t.Errorf("parseImageRef(%q).Tag should not be empty", tt.imageRef)
+			if info.Tag == "latest" && !strings.HasSuffix(ref, ":latest") && strings.Contains(ref, ":") {
+				t.Errorf("%s: %q parsed to tag %q, but the reference pins a different one", filepath.Base(path), ref, info.Tag)
 			}
-			// hash may be empty, that's OK
-		})
+			if host, _, found := strings.Cut(ref, "/"); found && !isDockerHubHost(host) &&
+				strings.ContainsAny(host, ".:") && !strings.HasPrefix(info.Name, host+"/") {
+				t.Errorf("%s: %q parsed to repository %q, the registry host was dropped", filepath.Base(path), ref, info.Name)
+			}
+		}
 	}
 }
 
-func TestCheckCPUResources(t *testing.T) {
-	result := checkCPUResources()
-	// assuming test machine has at least 2 CPUs, this is reasonable for CI/dev environments
-	if !result {
-		t.Logf("CPU check returned false - this is expected on machines with < 2 CPUs")
+// Host-relative: on a host with N >= 2 CPUs only a threshold above N fails it.
+func TestHelpers_CheckCPUResources_AgreesWithTheHostCPUCount(t *testing.T) {
+	if got, want := checkCPUResources(), runtime.NumCPU() >= 2; got != want {
+		t.Errorf("checkCPUResources = %t with %d CPUs, want %t", got, runtime.NumCPU(), want)
 	}
 }
 
-func TestCheckMemoryResources(t *testing.T) {
+func TestHelpers_CalculateRequiredMemoryGB_AddsWhatEachStartingComponentNeeds(t *testing.T) {
 	tests := []struct {
-		name                     string
-		needsForPentagi          bool
-		needsForGraphiti         bool
-		needsForLangfuse         bool
-		needsForObservability    bool
-		expectMinimumRequirement bool
+		name                                       string
+		pentagi, graphiti, langfuse, observability bool
+		want                                       float64
 	}{
-		{
-			name:                     "no components needed",
-			needsForPentagi:          false,
-			needsForGraphiti:         false,
-			needsForLangfuse:         false,
-			needsForObservability:    false,
-			expectMinimumRequirement: true,
-		},
-		{
-			name:                     "pentagi only",
-			needsForPentagi:          true,
-			needsForGraphiti:         false,
-			needsForLangfuse:         false,
-			needsForObservability:    false,
-			expectMinimumRequirement: false, // requires actual memory check
-		},
-		{
-			name:                     "all components",
-			needsForPentagi:          true,
-			needsForGraphiti:         true,
-			needsForLangfuse:         true,
-			needsForObservability:    true,
-			expectMinimumRequirement: false, // requires actual memory check
-		},
+		{"nothing to start", false, false, false, false, 0.5},
+		{"pentagi", true, false, false, false, 1.0},
+		{"graphiti", false, true, false, false, 2.5},
+		{"langfuse", false, false, true, false, 2.0},
+		{"observability", false, false, false, true, 2.0},
+		{"everything", true, true, true, true, 6.0},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := checkMemoryResources(tt.needsForPentagi, tt.needsForGraphiti, tt.needsForLangfuse, tt.needsForObservability)
-			if tt.expectMinimumRequirement && !result {
-				t.Errorf("checkMemoryResources() should return true when no components are needed")
-			}
-			// note: we can't reliably test memory checks across different environments
-			// the function will work correctly based on actual system memory
-		})
+		if got := calculateRequiredMemoryGB(tt.pentagi, tt.graphiti, tt.langfuse, tt.observability); got != tt.want {
+			t.Errorf("%s: %v GB, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
-func TestCheckDiskSpaceWithContext(t *testing.T) {
-	ctx := context.Background()
+func TestHelpers_CheckMemoryResources_PassesWhenNothingStartsAndTheHostHasRoom(t *testing.T) {
+	if !checkMemoryResources(false, false, false, false) {
+		t.Error("nothing to start is refused")
+	}
+	check := map[string]func(float64) bool{"darwin": checkDarwinMemory, "linux": checkLinuxMemory}[runtime.GOOS]
+	if check == nil {
+		t.Skipf("no memory check on %s", runtime.GOOS)
+	}
+	// The platform comparison, both ways, with requirements no host can miss or meet.
+	if !check(0) || check(1e6) {
+		t.Errorf("0 GB passes: %t, a million GB passes: %t; want only the first", check(0), check(1e6))
+	}
+	// Host-relative and one way only: pentagi alone needs 1 GB, and the margin keeps a host near it from flaking.
+	got, free := checkMemoryResources(true, false, false, false), getAvailableMemoryGB()
+	if free > 1.5 && !got {
+		t.Errorf("%.1f GB free refuses to start pentagi", free)
+	}
+}
 
+func TestHelpers_CountLocalComponentsToInstall_CountsLocalStacksNotYetInstalled(t *testing.T) {
+	tests := []struct {
+		name                                             string
+		pentagi                                          bool
+		graphitiConnected, graphitiExternal, graphitiIns bool
+		langfuseConnected, langfuseExternal, langfuseIns bool
+		obsConnected, obsExternal, obsIns                bool
+		want                                             int
+	}{
+		{"everything installed", true, true, false, true, true, false, true, true, false, true, 0},
+		{"pentagi missing", false, false, false, false, false, false, false, false, false, false, 1},
+		{"a local graphiti missing", true, true, false, false, false, false, false, false, false, false, 1},
+		{"a local langfuse missing", true, false, false, false, true, false, false, false, false, false, 1},
+		{"a local observability missing", true, false, false, false, false, false, false, true, false, false, 1},
+		{"external stacks need no local space", true, true, true, false, true, true, false, true, true, false, 0},
+		{"everything missing", false, true, false, false, true, false, false, true, false, false, 4},
+	}
+
+	for _, tt := range tests {
+		got := countLocalComponentsToInstall(tt.pentagi,
+			tt.graphitiConnected, tt.graphitiExternal, tt.graphitiIns,
+			tt.langfuseConnected, tt.langfuseExternal, tt.langfuseIns,
+			tt.obsConnected, tt.obsExternal, tt.obsIns)
+		if got != tt.want {
+			t.Errorf("%s: %d components, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestHelpers_CalculateRequiredDiskGB_ReservesForWorkerImagesFirst(t *testing.T) {
 	tests := []struct {
 		name              string
 		workerImageExists bool
-		pentagiInstalled  bool
-		graphitiConnected bool
-		graphitiExternal  bool
-		graphitiInstalled bool
-		langfuseConnected bool
-		langfuseExternal  bool
-		langfuseInstalled bool
-		obsConnected      bool
-		obsExternal       bool
-		obsInstalled      bool
-		expectHighSpace   bool // whether we expect it to require more disk space
+		localComponents   int
+		want              float64
 	}{
-		{
-			name:              "all installed and running",
-			workerImageExists: true,
-			pentagiInstalled:  true,
-			graphitiConnected: true,
-			graphitiExternal:  false,
-			graphitiInstalled: true,
-			langfuseConnected: true,
-			langfuseExternal:  false,
-			langfuseInstalled: true,
-			obsConnected:      true,
-			obsExternal:       false,
-			obsInstalled:      true,
-			expectHighSpace:   false, // minimal space needed
-		},
-		{
-			name:              "no worker images",
-			workerImageExists: false,
-			pentagiInstalled:  true,
-			expectHighSpace:   true, // needs to download images
-		},
-		{
-			name:              "pentagi not installed",
-			workerImageExists: true,
-			pentagiInstalled:  false,
-			expectHighSpace:   false, // moderate space for components
-		},
-		{
-			name:              "langfuse local not installed",
-			workerImageExists: true,
-			pentagiInstalled:  true,
-			langfuseConnected: true,
-			langfuseExternal:  false,
-			langfuseInstalled: false,
-			expectHighSpace:   false, // moderate space for components
-		},
+		{"no worker image yet", false, 2, 25},
+		{"two local components to install", true, 2, 14},
+		{"nothing to install", true, 0, 5},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := checkDiskSpaceWithContext(
-				ctx,
-				tt.workerImageExists,
-				tt.pentagiInstalled,
-				tt.graphitiConnected,
-				tt.graphitiExternal,
-				tt.graphitiInstalled,
-				tt.langfuseConnected,
-				tt.langfuseExternal,
-				tt.langfuseInstalled,
-				tt.obsConnected,
-				tt.obsExternal,
-				tt.obsInstalled,
-			)
-			// note: actual disk space check depends on OS and available space
-			// we mainly test that the function doesn't panic and returns a boolean
-			_ = result
-		})
+		if got := calculateRequiredDiskGB(tt.workerImageExists, tt.localComponents); got != tt.want {
+			t.Errorf("%s: %v GB, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
-func TestCheckUpdatesServer(t *testing.T) {
-	// test successful response
-	t.Run("successful_response", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != "POST" {
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				return
-			}
-			if r.Header.Get("Content-Type") != "application/json" {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			if r.Header.Get("User-Agent") != UserAgent {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{
-				"installer_is_up_to_date": true,
-				"pentagi_is_up_to_date": false,
-				"langfuse_is_up_to_date": true,
-				"observability_is_up_to_date": false,
-				"worker_is_up_to_date": true
-			}`)
-		}))
-		defer ts.Close()
-
-		ctx := context.Background()
-		request := CheckUpdatesRequest{
-			InstallerVersion: "1.0.0",
-			InstallerOsType:  "darwin",
-		}
-
-		response := checkUpdatesServer(ctx, ts.URL, "", request)
-		if response == nil {
-			t.Fatal("expected non-nil response")
-		}
-		if !response.InstallerIsUpToDate {
-			t.Error("expected installer to be up to date")
-		}
-		if response.PentagiIsUpToDate {
-			t.Error("expected pentagi to not be up to date")
-		}
-		if !response.LangfuseIsUpToDate {
-			t.Error("expected langfuse to be up to date")
-		}
-		if response.ObservabilityIsUpToDate {
-			t.Error("expected observability to not be up to date")
-		}
-		if !response.WorkerIsUpToDate {
-			t.Error("expected worker to be up to date")
-		}
-	})
-
-	// test server error
-	t.Run("server_error", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer ts.Close()
-
-		ctx := context.Background()
-		request := CheckUpdatesRequest{InstallerVersion: "1.0.0"}
-
-		response := checkUpdatesServer(ctx, ts.URL, "", request)
-		if response != nil {
-			t.Error("expected nil response for server error")
-		}
-	})
-
-	// test invalid JSON response
-	t.Run("invalid_json", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `invalid json`)
-		}))
-		defer ts.Close()
-
-		ctx := context.Background()
-		request := CheckUpdatesRequest{InstallerVersion: "1.0.0"}
-
-		response := checkUpdatesServer(ctx, ts.URL, "", request)
-		if response != nil {
-			t.Error("expected nil response for invalid JSON")
-		}
-	})
-
-	// test context timeout
-	t.Run("context_timeout", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(100 * time.Millisecond) // delay response
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer ts.Close()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		request := CheckUpdatesRequest{InstallerVersion: "1.0.0"}
-		response := checkUpdatesServer(ctx, ts.URL, "", request)
-		if response != nil {
-			t.Error("expected nil response for timeout")
-		}
-	})
-
-	// test proxy configuration
-	t.Run("with_proxy", func(t *testing.T) {
-		// create a proxy server that just forwards requests
-		proxyTs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"installer_is_up_to_date": true, "pentagi_is_up_to_date": true, "langfuse_is_up_to_date": true, "observability_is_up_to_date": true}`)
-		}))
-		defer proxyTs.Close()
-
-		ctx := context.Background()
-		request := CheckUpdatesRequest{InstallerVersion: "1.0.0"}
-
-		// note: testing with actual proxy setup is complex in unit tests
-		// this mainly tests that proxy URL doesn't cause the function to panic
-		response := checkUpdatesServer(ctx, proxyTs.URL, "http://invalid-proxy:8080", request)
-		// response might be nil due to proxy connection failure, which is expected
-		_ = response
-	})
-
-	// test malformed server URL
-	t.Run("malformed_url", func(t *testing.T) {
-		ctx := context.Background()
-		request := CheckUpdatesRequest{InstallerVersion: "1.0.0"}
-
-		response := checkUpdatesServer(ctx, "://invalid-url", "", request)
-		if response != nil {
-			t.Error("expected nil response for malformed URL")
-		}
-	})
-}
-
-func TestCreateTempFileForTesting(t *testing.T) {
-	// helper test to ensure temp file creation works for other tests
-	tmpDir := os.TempDir()
-	testFile := filepath.Join(tmpDir, "checker_test_file")
-
-	// create test file
-	err := os.WriteFile(testFile, []byte("test content"), 0644)
-	if err != nil {
-		t.Fatal(err)
+func TestHelpers_CheckDiskSpaceWithContext_PassesAnInstalledStackWhenTheHostHasRoom(t *testing.T) {
+	check := map[string]func(context.Context, float64) bool{
+		"darwin": checkDarwinDiskSpace, "linux": checkLinuxDiskSpace,
+	}[runtime.GOOS]
+	if check == nil {
+		t.Skipf("no disk check on %s", runtime.GOOS)
 	}
-	defer os.Remove(testFile)
-
-	// verify it exists and is readable
-	if !checkFileExists(testFile) {
-		t.Error("test file should exist")
+	// The platform comparison, both ways, with requirements no host can miss or meet.
+	if !check(t.Context(), 0) || check(t.Context(), 1e9) {
+		t.Errorf("0 GB passes: %t, a billion GB passes: %t; want only the first", check(t.Context(), 0), check(t.Context(), 1e9))
 	}
-	if !checkFileIsReadable(testFile) {
-		t.Error("test file should be readable")
-	}
-
-	// note: directory readability behavior is platform-dependent
-	// so we skip this assertion
-}
-
-func TestConstants(t *testing.T) {
-	// test that critical constants are defined
-	if InstallerVersion == "" {
-		t.Error("InstallerVersion should not be empty")
-	}
-	if UserAgent == "" {
-		t.Error("UserAgent should not be empty")
-	}
-	if !strings.Contains(UserAgent, InstallerVersion) {
-		t.Error("UserAgent should contain InstallerVersion")
-	}
-	if DefaultUpdateServerEndpoint == "" {
-		t.Error("DefaultUpdateServerEndpoint should not be empty")
-	}
-	if UpdatesCheckEndpoint == "" {
-		t.Error("UpdatesCheckEndpoint should not be empty")
-	}
-
-	// test memory and disk constants are reasonable
-	if MinFreeMemGB <= 0 {
-		t.Error("MinFreeMemGB should be positive")
-	}
-	if MinFreeMemGBForPentagi <= 0 {
-		t.Error("MinFreeMemGBForPentagi should be positive")
-	}
-	if MinFreeDiskGB <= 0 {
-		t.Error("MinFreeDiskGB should be positive")
-	}
-	if MinFreeDiskGBForWorkerImages <= MinFreeDiskGB {
-		t.Error("MinFreeDiskGBForWorkerImages should be larger than MinFreeDiskGB")
+	// Host-relative and one way only: everything installed needs 5 GB, and the margin keeps a host near it from flaking.
+	free := getAvailableDiskGB(t.Context())
+	if got := checkDiskSpaceWithContext(t.Context(), true, true,
+		true, false, true, true, false, true, true, false, true); free > 5.5 && !got {
+		t.Errorf("%.1f GB free refuses an installation that needs 5", free)
 	}
 }
 
-func TestCheckImageExistsEdgeCases(t *testing.T) {
-	ctx := context.Background()
-
-	// test with nil client
-	result := checkImageExists(ctx, nil, "nginx:latest")
-	if result {
-		t.Error("checkImageExists should return false for nil client")
-	}
-
-	// test with empty image name
-	// note: we can't test with real Docker client in unit tests
-	// but we can test that the function handles edge cases gracefully
-}
-
-func TestGetImageInfoEdgeCases(t *testing.T) {
-	ctx := context.Background()
-
-	// test with nil client
-	result := getImageInfo(ctx, nil, "nginx:latest")
-	if result != nil {
-		t.Error("getImageInfo should return nil for nil client")
-	}
-
-	// test with empty image name
-	// again, testing without real Docker client
-}
-
-func TestCheckUpdatesRequestStructure(t *testing.T) {
-	// test that CheckUpdatesRequest can be marshaled to JSON
-	request := CheckUpdatesRequest{
-		InstallerOsType:        "darwin",
-		InstallerVersion:       "1.0.0",
-		LangfuseConnected:      true,
-		LangfuseExternal:       false,
-		ObservabilityConnected: true,
-		ObservabilityExternal:  false,
-	}
-
-	result := fmt.Sprintf("%+v", request)
-	if result == "" {
-		t.Error("CheckUpdatesRequest should be formattable")
-	}
-
-	// test with pointer fields
-	imageName := "test-image"
-	imageTag := "latest"
-	imageHash := "sha256:abc123"
-
-	request.PentagiImageName = &imageName
-	request.PentagiImageTag = &imageTag
-	request.PentagiImageHash = &imageHash
-
-	result = fmt.Sprintf("%+v", request)
-	if result == "" {
-		t.Error("CheckUpdatesRequest with pointers should be formattable")
-	}
-}
-
-func TestImageInfoStructure(t *testing.T) {
-	// test ImageInfo struct
-	info := &ImageInfo{
-		Name: "nginx",
-		Tag:  "latest",
-		Hash: "sha256:abc123",
-	}
-
-	if info.Name != "nginx" {
-		t.Error("ImageInfo.Name should be set correctly")
-	}
-	if info.Tag != "latest" {
-		t.Error("ImageInfo.Tag should be set correctly")
-	}
-	if info.Hash != "sha256:abc123" {
-		t.Error("ImageInfo.Hash should be set correctly")
-	}
-}
-
-func TestCheckVolumesExist(t *testing.T) {
-	// note: this test uses a mock volume list since we can't rely on real Docker client in unit tests
-	// in real scenarios, checkVolumesExist is called with actual Docker API client
-
-	// test with nil client
-	t.Run("nil_client", func(t *testing.T) {
-		ctx := context.Background()
-		volumeNames := []string{"test-volume"}
-		result := checkVolumesExist(ctx, nil, volumeNames)
-		if result {
-			t.Error("checkVolumesExist should return false for nil client")
-		}
-	})
-
-	// test with empty volume list
-	t.Run("empty_volume_list", func(t *testing.T) {
-		ctx := context.Background()
-		// we can't create a real client in unit tests, so we pass nil
-		// the function should handle empty list gracefully
-		result := checkVolumesExist(ctx, nil, []string{})
-		if result {
-			t.Error("checkVolumesExist should return false for empty volume list")
-		}
-	})
-
-	// note: testing actual volume matching requires Docker integration tests
-	// the function logic handles:
-	// 1. Exact match: "pentagi-data" matches "pentagi-data"
-	// 2. Compose prefix match: "pentagi-data" matches "pentagi_pentagi-data"
-	// 3. Compose prefix match: "pentagi-postgres-data" matches "myproject_pentagi-postgres-data"
-	//
-	// This ensures compatibility with Docker Compose project prefixes
-}
-
-// mockDockerVolume simulates Docker API volume structure for testing
-type mockDockerVolume struct {
-	Name string
-}
-
-func TestCheckVolumesExist_MatchingLogic(t *testing.T) {
-	// unit test for the matching logic without Docker client
-	// simulates what checkVolumesExist does internally
-
+func TestHelpers_CheckImageExists_FindsTheImageUnderItsFullReference(t *testing.T) {
+	docker := checkerFakeDocker(t, map[string]http.HandlerFunc{"GET /images/json": checkerJSON(http.StatusOK,
+		`[{"Id":"sha256:`+strings.Repeat("a", 64)+`","RepoTags":["vxcontrol/kali-linux:latest"]}]`)})
 	tests := []struct {
-		name            string
-		existingVolumes []string
-		searchVolumes   []string
-		expected        bool
-		description     string
+		name  string
+		cli   *client.Client
+		image string
+		want  bool
 	}{
-		{
-			name:            "exact match",
-			existingVolumes: []string{"pentagi-data", "other-volume"},
-			searchVolumes:   []string{"pentagi-data"},
-			expected:        true,
-			description:     "should match exact volume name",
-		},
-		{
-			name:            "compose prefix match",
-			existingVolumes: []string{"pentagi_pentagi-data", "pentagi_pentagi-ssl"},
-			searchVolumes:   []string{"pentagi-data"},
-			expected:        true,
-			description:     "should match volume with compose project prefix",
-		},
-		{
-			name:            "arbitrary prefix match",
-			existingVolumes: []string{"myproject_pentagi-postgres-data", "other_volume"},
-			searchVolumes:   []string{"pentagi-postgres-data"},
-			expected:        true,
-			description:     "should match volume with any compose prefix",
-		},
-		{
-			name:            "no match",
-			existingVolumes: []string{"other-volume", "another-volume"},
-			searchVolumes:   []string{"pentagi-data"},
-			expected:        false,
-			description:     "should not match when volume doesn't exist",
-		},
-		{
-			name:            "partial name should not match",
-			existingVolumes: []string{"pentagi-data-backup", "my-pentagi-data"},
-			searchVolumes:   []string{"pentagi-data"},
-			expected:        false,
-			description:     "should not match partial names without underscore separator",
-		},
-		{
-			name:            "match multiple search volumes",
-			existingVolumes: []string{"proj_pentagi-data", "langfuse-data"},
-			searchVolumes:   []string{"pentagi-data", "langfuse-data", "missing-volume"},
-			expected:        true,
-			description:     "should return true if any search volume matches",
-		},
-		{
-			name:            "empty existing volumes",
-			existingVolumes: []string{},
-			searchVolumes:   []string{"pentagi-data"},
-			expected:        false,
-			description:     "should return false when no volumes exist",
-		},
-		{
-			name:            "multiple compose prefixes",
-			existingVolumes: []string{"proj1_vol1", "proj2_vol2", "pentagi_pentagi-ssl"},
-			searchVolumes:   []string{"pentagi-ssl"},
-			expected:        true,
-			description:     "should find volume among multiple compose projects",
-		},
+		{"the tag the daemon lists", docker, "vxcontrol/kali-linux:latest", true},
+		{"the implicit latest tag", docker, "vxcontrol/kali-linux", true},
+		{"an image the daemon does not have", docker, "debian:latest", false},
+		{"no daemon", nil, "vxcontrol/kali-linux:latest", false},
+	}
+
+	for _, tt := range tests {
+		if got := checkImageExists(t.Context(), tt.cli, tt.image); got != tt.want {
+			t.Errorf("%s: checkImageExists(%q) = %t, want %t", tt.name, tt.image, got, tt.want)
+		}
+	}
+}
+
+func TestHelpers_CheckVolumesExist_MatchesANameOrItsComposeProjectPrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []string // nil makes the daemon refuse the listing
+		search   []string
+		want     bool
+	}{
+		{"an exact name", []string{"pentagi-data", "other-volume"}, []string{"pentagi-data"}, true},
+		{"a compose project prefix", []string{"pentagi_pentagi-data", "pentagi_pentagi-ssl"}, []string{"pentagi-data"}, true},
+		{"no such volume", []string{"other-volume", "another-volume"}, []string{"pentagi-data"}, false},
+		{"a longer name is not a match", []string{"pentagi-data-backup", "my-pentagi-data"}, []string{"pentagi-data"}, false},
+		{"any of the searched names", []string{"other-volume", "langfuse-data"}, []string{"pentagi-data", "langfuse-data"}, true},
+		{"no volumes at all", []string{}, []string{"pentagi-data"}, false},
+		{"nothing searched", []string{"pentagi-data"}, []string{}, false},
+		{"the daemon refuses the listing", nil, []string{"pentagi-data"}, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// simulate the matching logic from checkVolumesExist
-			result := false
-			for _, volumeName := range tt.searchVolumes {
-				for _, existingVolume := range tt.existingVolumes {
-					if existingVolume == volumeName || strings.HasSuffix(existingVolume, "_"+volumeName) {
-						result = true
-						break
-					}
+			listing := checkerJSON(http.StatusInternalServerError, `{"message":"daemon error"}`)
+			if tt.existing != nil {
+				volumes := make([]map[string]string, 0, len(tt.existing))
+				for _, name := range tt.existing {
+					volumes = append(volumes, map[string]string{"Name": name})
 				}
-				if result {
-					break
-				}
+				body, _ := json.Marshal(map[string]any{"Volumes": volumes})
+				listing = checkerJSON(http.StatusOK, string(body))
 			}
+			cli := checkerFakeDocker(t, map[string]http.HandlerFunc{"GET /volumes": listing})
 
-			if result != tt.expected {
-				t.Errorf("%s: got %v, want %v", tt.description, result, tt.expected)
+			if got := checkVolumesExist(t.Context(), cli, tt.search); got != tt.want {
+				t.Errorf("checkVolumesExist(%q) = %t, want %t", tt.search, got, tt.want)
 			}
 		})
+	}
+	if checkVolumesExist(t.Context(), nil, []string{"pentagi-data"}) {
+		t.Error("no daemon reports a volume")
 	}
 }

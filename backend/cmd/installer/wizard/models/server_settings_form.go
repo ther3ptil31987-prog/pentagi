@@ -16,6 +16,7 @@ import (
 	"pentagi/pkg/config"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/vxcontrol/cloud/models"
 	"github.com/vxcontrol/cloud/sdk"
 )
 
@@ -49,6 +50,27 @@ func (m *ServerSettingsFormModel) BuildForm() tea.Cmd {
 		locale.ServerSettingsLicenseKeyDesc,
 		config.LicenseKey,
 		true,
+	))
+
+	fields = append(fields, m.createTextField("update_strategy",
+		locale.ServerSettingsUpdateStrategy,
+		locale.ServerSettingsUpdateStrategyDesc,
+		config.UpdateStrategy,
+		false,
+	))
+
+	fields = append(fields, m.createTextField("update_server_host",
+		locale.ServerSettingsUpdateServerHost,
+		locale.ServerSettingsUpdateServerHostDesc,
+		config.UpdateServerHost,
+		false,
+	))
+
+	fields = append(fields, m.createTextField("support_server_host",
+		locale.ServerSettingsSupportServerHost,
+		locale.ServerSettingsSupportServerHostDesc,
+		config.SupportServerHost,
+		false,
 	))
 
 	fields = append(fields, m.createTextField("pentagi_tenant_id",
@@ -93,6 +115,14 @@ func (m *ServerSettingsFormModel) BuildForm() tea.Cmd {
 		locale.ServerSettingsCORSOrigins,
 		locale.ServerSettingsCORSOriginsDesc,
 		config.CorsOrigins,
+		false,
+	))
+
+	// trusted proxies
+	fields = append(fields, m.createTextField("pentagi_trusted_proxies",
+		locale.ServerSettingsTrustedProxies,
+		locale.ServerSettingsTrustedProxiesDesc,
+		config.TrustedProxies,
 		false,
 	))
 
@@ -440,6 +470,8 @@ func (m *ServerSettingsFormModel) GetHelpContent() string {
 			sections = append(sections, locale.ServerSettingsPublicURLHelp)
 		case "pentagi_cors_origins":
 			sections = append(sections, locale.ServerSettingsCORSOriginsHelp)
+		case "pentagi_trusted_proxies":
+			sections = append(sections, locale.ServerSettingsTrustedProxiesHelp)
 		case "proxy_url":
 			sections = append(sections, locale.ServerSettingsProxyURLHelp)
 		case "http_client_timeout":
@@ -475,10 +507,14 @@ func (m *ServerSettingsFormModel) HandleSave() error {
 	newCfg := &controller.ServerSettingsConfig{
 		TenantID:                 cfg.TenantID,
 		LicenseKey:               cfg.LicenseKey,
+		UpdateStrategy:           cfg.UpdateStrategy,
+		UpdateServerHost:         cfg.UpdateServerHost,
+		SupportServerHost:        cfg.SupportServerHost,
 		PprofAddr:                cfg.PprofAddr,
 		ListenIP:                 cfg.ListenIP,
 		ListenPort:               cfg.ListenPort,
 		CorsOrigins:              cfg.CorsOrigins,
+		TrustedProxies:           cfg.TrustedProxies,
 		CookieSigningSalt:        cfg.CookieSigningSalt,
 		ProxyURL:                 cfg.ProxyURL,
 		HTTPClientTimeout:        cfg.HTTPClientTimeout,
@@ -505,6 +541,23 @@ func (m *ServerSettingsFormModel) HandleSave() error {
 				}
 			}
 			newCfg.LicenseKey.Value = value
+		case "update_strategy":
+			// Empty means "use the default", which is a legitimate answer and the
+			// one every existing installation currently gives. Anything else has to
+			// be a member of the vocabulary: the field is free text, so this is the
+			// only thing standing between a typo and an installation that quietly
+			// falls back to a channel the user did not pick.
+			if value != "" {
+				if err := models.UpdateStrategy(strings.ToLower(value)).Valid(); err != nil {
+					return fmt.Errorf("invalid update strategy %q: use preview, stable or nightly", value)
+				}
+				value = strings.ToLower(value)
+			}
+			newCfg.UpdateStrategy.Value = value
+		case "update_server_host":
+			newCfg.UpdateServerHost.Value = value
+		case "support_server_host":
+			newCfg.SupportServerHost.Value = value
 		case "pentagi_tenant_id":
 			if err := (&config.Config{TenantID: value}).ValidateTenantID(); err != nil {
 				return err
@@ -530,6 +583,8 @@ func (m *ServerSettingsFormModel) HandleSave() error {
 			newCfg.PublicURL.Value = value
 		case "pentagi_cors_origins":
 			newCfg.CorsOrigins.Value = value
+		case "pentagi_trusted_proxies":
+			newCfg.TrustedProxies.Value = value
 		case "proxy_url":
 			newCfg.ProxyURL.Value = value
 		case "proxy_username":
@@ -599,11 +654,11 @@ func (m *ServerSettingsFormModel) OnFieldChanged(fieldIndex int, oldValue, newVa
 }
 
 func (m *ServerSettingsFormModel) GetFormFields() []FormField {
-	return m.BaseScreen.fields
+	return m.fields
 }
 
 func (m *ServerSettingsFormModel) SetFormFields(fields []FormField) {
-	m.BaseScreen.fields = fields
+	m.fields = fields
 }
 
 // Update handles screen-specific input, then delegates to base screen

@@ -57,6 +57,10 @@ func RestoreModel(model tea.Model) BaseScreenModel {
 		return m
 	case *ApplyChangesFormModel:
 		return m
+	case *UpdateOverviewModel:
+		return m
+	case *InstallerUpdateModel:
+		return m
 	case *MaintenanceModel:
 		return m
 	case *ProcessorOperationFormModel:
@@ -93,6 +97,8 @@ const (
 	LLMProviderKimiScreen      ScreenID = "llm_provider_form§kimi"
 	LLMProviderQwenScreen      ScreenID = "llm_provider_form§qwen"
 	LLMProviderMiniMaxScreen   ScreenID = "llm_provider_form§minimax"
+	LLMProviderMistralScreen   ScreenID = "llm_provider_form§mistral"
+	LLMProviderXAIScreen       ScreenID = "llm_provider_form§xai"
 
 	// Summarizer screens
 	SummarizerScreen          ScreenID = "summarizer"
@@ -115,7 +121,11 @@ const (
 	DockerFormScreen           ScreenID = "docker_form"
 
 	// Management screens
-	ApplyChangesScreen        ScreenID = "apply_changes"
+	ApplyChangesScreen ScreenID = "apply_changes"
+	// UpdateOverviewScreen shows what the update changes before it is applied.
+	// It stands between the menu entry and UpdatePentagiScreen below, which the
+	// entry used to point at directly.
+	UpdateOverviewScreen      ScreenID = "update_overview"
 	InstallPentagiScreen      ScreenID = "processor_operation_form§all§install"
 	StartPentagiScreen        ScreenID = "processor_operation_form§all§start"
 	StopPentagiScreen         ScreenID = "processor_operation_form§all§stop"
@@ -123,12 +133,15 @@ const (
 	DownloadWorkerImageScreen ScreenID = "processor_operation_form§worker§download"
 	UpdateWorkerImageScreen   ScreenID = "processor_operation_form§worker§update"
 	UpdatePentagiScreen       ScreenID = "processor_operation_form§compose§update"
-	UpdateInstallerScreen     ScreenID = "processor_operation_form§installer§update"
-	FactoryResetScreen        ScreenID = "processor_operation_form§all§factory_reset"
-	RemovePentagiScreen       ScreenID = "processor_operation_form§all§remove"
-	PurgePentagiScreen        ScreenID = "processor_operation_form§all§purge"
-	ResetPasswordScreen       ScreenID = "reset_password"
-	MaintenanceScreen         ScreenID = "maintenance"
+	// InstallerUpdateScreen is its own screen and not an operation form: what it does is
+	// download one verified file, which the generic form described as replacing the
+	// running binary and exiting.
+	InstallerUpdateScreen ScreenID = "installer_update"
+	FactoryResetScreen    ScreenID = "processor_operation_form§all§factory_reset"
+	RemovePentagiScreen   ScreenID = "processor_operation_form§all§remove"
+	PurgePentagiScreen    ScreenID = "processor_operation_form§all§purge"
+	ResetPasswordScreen   ScreenID = "reset_password"
+	MaintenanceScreen     ScreenID = "maintenance"
 )
 
 type LLMProviderID string
@@ -145,6 +158,8 @@ const (
 	LLMProviderKimi      LLMProviderID = "kimi"
 	LLMProviderQwen      LLMProviderID = "qwen"
 	LLMProviderMiniMax   LLMProviderID = "minimax"
+	LLMProviderMistral   LLMProviderID = "mistral"
+	LLMProviderXAI       LLMProviderID = "xai"
 )
 
 // NavigationMsg represents screen navigation requests
